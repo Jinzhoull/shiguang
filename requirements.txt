@@ -1,0 +1,11 @@
+# 拾光 Shiguang 运行依赖
+# 安装（推荐国内镜像）：
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+customtkinter>=5.2,<7      # 现代化 Tk 控件库（圆角卡片 / 深浅色主题）
+pillow>=9.0                # 运行期生成图标 + 界面截图
+pystray>=0.19              # 系统托盘
+darkdetect>=0.7            # 跟随系统深色模式（customtkinter 依赖）
+
+# 仅打包时需要
+# pyinstaller>=6.0

@@ -1,0 +1,43 @@
+# 拾光 —— 只提交源码与文档，下列全部是「可再生产物」
+
+# 字节码
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# 本地虚拟环境与凭据
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# PyInstaller 中间产物（每次打包重建，动辄 70MB）
+build/
+
+# 绿色版发布包（发布时单独归档，不跟随源码）
+dist/
+
+# 截图 / 自检用的临时数据目录（运行期自动创建）
+.preview-data/
+
+# 构建时导出的图标留档（build.py 每次刷新，运行期靠 icons.py 内存自绘）
+assets/icons/
+
+# 截图工具生成的预览图
+docs/preview/
+tools/preview/
+
+# Codex / 本机工作记忆与运行期数据，不能作为项目源码上传
+.workbuddy/
+.preview-data/
+
+# 编辑器与本机杂项
+.vscode/
+.idea/
+*.swp
+.DS_Store
+*.log
