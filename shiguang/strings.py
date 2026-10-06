@@ -15,7 +15,7 @@
 约定
 ----
 * **零 emoji 上屏**。项目从 1.2.0 起就把 emoji 全部换成自绘图标（系统 emoji
-  的配色不可控、基线不可控、缺字体就是豆腐块）。所以"今天的光都拾起来了"
+  的配色不可控、基线不可控、缺字体就是豆腐块）。所以全部完成态的
   后面那轮太阳由 ``icons`` 画出来，而不是在字符串里塞 U+2600。
 * 文案里不写标点收尾的句号（界面短句统一不带句号），不写"点击这里"这类
   指示代词——按钮本身就是指示。
@@ -32,8 +32,8 @@ EMPTY_ALL_HINT = "添加第一个任务吧，一缕光也算数"
 EMPTY_ALL_CTA = "＋  添加第一个任务"
 
 #: 今天有任务、且全部完成（配粒子动画）
-EMPTY_DONE_TITLE = "今天的光都拾起来了"
-EMPTY_DONE_HINT = "明天再来拾一缕吧"
+EMPTY_DONE_TITLE = "今天的任务都完成了"
+EMPTY_DONE_HINT = "辛苦啦，休息一下吧"
 
 #: 某个分组空了（卡片内的轻提示，不占整页）
 EMPTY_GROUP_HINT = "这里还很空，添一件想做的事吧"
@@ -83,6 +83,14 @@ TITLE_ELLIPSIS = "…"
 HOTKEY_SAVED_HINT = "✓ 已保存"
 #: 新建任务浮层底部的快捷键提示（辅助文字色一行，让 Enter/Esc 可被发现）
 QUICK_ADD_KEYS_HINT = "Enter 快速添加 · Esc 关闭"
+
+TASK_FILTER_OPTIONS = ["全部任务", "今天到期", "逾期", "未完成", "已完成"]
+TASK_SEARCH_HINT = "搜索任务"
+TASK_FILTER_EMPTY_TITLE = "没有找到匹配的任务"
+TASK_FILTER_EMPTY_HINT = "换个关键词或调整筛选条件试试"
+TASK_FILTER_CLEAR = "清除搜索和筛选"
+TASK_FILTER_RESTORE = "已恢复删除的任务"
+TASK_FILTER_UNDO = "撤销"
 
 
 def empty_title(has_tasks: bool, all_done: bool) -> str:

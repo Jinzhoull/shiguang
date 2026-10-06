@@ -1,23 +1,10 @@
 # -*- coding: utf-8 -*-
-"""核心逻辑自检（纯数据层，不建窗口、不弹窗、不打开任何文件）。
+"""核心逻辑自检（11 组，不建窗口、不弹窗、不打开日常数据文件）。
 
-运行：``python tests/test_core.py``（或 ``python run.py --selftest``）
+运行：``python tests/test_core.py``（或 ``python run.py --selftest``）。
 
-只保留 10 个用例，覆盖"错了会真的丢数据/算错数"的地方：
-
-1. 默认数据与任务增删改排序
-2. 跨分组移动
-3. 完成状态与历史口径（重复完成不重复计数、取消会回退）
-4. 截止日期解析容错
-5. 截止日期序列化与旧数据兼容
-6. 逾期 / 今日到期口径
-7. 连续打卡与全部完成判定
-8. 持久化、原子写与损坏数据恢复
-9. 到期提醒口径（提前量 / 不提醒 / 去重）与字段序列化兼容
-10. 组内自动排序（未完成按截止升序、已完成按完成时间降序、同键拖拽兜底）
-
-刻意不做的事：像素/颜色/布局断言、真实抓屏、进程往返。那些既慢又会
-弹窗抢焦点，而且历史上并没抓到过真正的数据问题。
+覆盖任务增删改、完成历史、日期与提醒、排序、持久化与损坏恢复、备份导入导出、
+专注统计等用户数据关键路径。界面像素和交互由 ``tools/screenshot.py`` 另行检查。
 """
 
 from __future__ import annotations
@@ -197,6 +184,8 @@ def test_due_states(tmp: Path) -> None:
     soon = store.add_task("今天到期", gid, due_date=today_late)
     later = store.add_task("还早", gid, due_date=now + _dt.timedelta(days=5))
     none = store.add_task("没期限", gid)
+    old_open = store.add_task("昨日任务", gid, due_date=now - _dt.timedelta(days=1))
+    store.update_task(none.id, note="客户电话记录")
 
     # is_overdue / is_due_today 是**属性**，不是方法（这里踩过一次）
     check("逾期判定", over.is_overdue is True)
@@ -211,10 +200,25 @@ def test_due_states(tmp: Path) -> None:
     check("按截止时间升序、无期限排最后",
           [t.title for t in sorted(store.all_tasks(),
                                    key=lambda t: (t.due_date is None, t.due_date))]
-          == ["已逾期", "今天到期", "还早", "没期限"],
+           == ["昨日任务", "已逾期", "今天到期", "还早", "没期限"],
           str([t.title for t in sorted(
               store.all_tasks(),
               key=lambda t: (t.due_date is None, t.due_date))]))
+    from shiguang.models import task_matches_filter
+
+    check("今日筛选包含今天到期、未完成的任务",
+          task_matches_filter(soon, filter_key="today", today=_dt.date.today())
+          and not task_matches_filter(over, filter_key="today", today=_dt.date.today()))
+    check("逾期筛选只含未完成的逾期任务",
+          task_matches_filter(old_open, filter_key="overdue")
+          and not task_matches_filter(over, filter_key="overdue"))
+    check("状态筛选区分未完成和已完成",
+          task_matches_filter(old_open, filter_key="open")
+          and task_matches_filter(over, filter_key="done")
+          and not task_matches_filter(over, filter_key="open"))
+    check("搜索同时匹配标题与备注",
+          task_matches_filter(none, query="客户电话")
+          and not task_matches_filter(none, query="不存在"))
 
 
 # ---------------------------------------------------------------- 7
@@ -237,6 +241,116 @@ def test_persist_and_recover(tmp: Path) -> None:
     check("损坏文件不崩溃（回落默认）", len(recovered.groups) == 3)
     check("损坏文件已备份留档", bool(list((tmp / "t7").glob("data.corrupt-*.json"))),
           str(list((tmp / "t7").glob("*.json"))))
+
+    # JSON 可解析但字段类型错误时，保留可读任务并修复坏值。
+    schema_dir = tmp / "t7-schema"
+    schema = _fresh(schema_dir)
+    schema_task = schema.add_task("仍要保留的任务", schema.groups[0].id)
+    schema.save(force=True)
+    schema_path = schema_dir / "data.json"
+    payload = json.loads(schema_path.read_text(encoding="utf-8"))
+    payload["history"] = {"2026-09-26": "not-a-number"}
+    payload["tasks"].append({"id": "broken", "title": "坏任务",
+                             "group_id": schema.groups[0].id,
+                             "priority": "not-a-number"})
+    schema_path.write_text(json.dumps(payload), encoding="utf-8")
+    schema_recovered = _fresh(schema_dir)
+    check("字段异常不会阻止启动", schema_recovered.task(schema_task.id) is not None)
+    check("单条坏任务被跳过而好任务保留",
+          len(schema_recovered.all_tasks()) == 1
+          and schema_recovered.task(schema_task.id) is not None)
+    check("异常计数安全回退为 0",
+          schema_recovered.history_get("2026-09-26") == 0)
+    check("字段修复前保留原始文件副本",
+          bool(list(schema_dir.glob("data.corrupt-*.json"))))
+
+    # Settings are JSON input too: invalid types and out-of-range durations must
+    # fall back safely before UI/services attempt to consume them.
+    settings_dir = tmp / "t7-settings"
+    settings_store = _fresh(settings_dir)
+    settings_store.add_task("保留设置异常时的任务", settings_store.groups[0].id)
+    settings_store.save(force=True)
+    settings_path = settings_dir / "data.json"
+    settings_payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings_payload["settings"].update({
+        "theme": ["dark"], "onboarded": "false", "pomodoro_minutes": "oops",
+        "break_minutes": 0, "due_just_minutes": -2,
+        "group_icons": ["not-a-map"], "default_group": "deleted-group",
+    })
+    settings_path.write_text(json.dumps(settings_payload), encoding="utf-8")
+    safe_settings = _fresh(settings_dir)
+    check("坏设置不会阻止启动且保留可读任务",
+          len(safe_settings.all_tasks()) == 1)
+    check("坏设置字段安全回落默认值",
+          safe_settings.settings["theme"] == "system"
+          and safe_settings.settings["onboarded"] is False
+          and safe_settings.settings["pomodoro_minutes"] == 25
+          and safe_settings.settings["break_minutes"] == 5
+          and safe_settings.settings["due_just_minutes"] == 5
+          and safe_settings.settings["group_icons"] == {}
+          and safe_settings.settings["default_group"] == safe_settings.groups[0].id)
+    check("设置修复前也保留原始文件副本",
+          bool(list(settings_dir.glob("data.corrupt-*.json"))))
+
+    empty_groups_dir = tmp / "t7-empty-groups"
+    empty_groups = _fresh(empty_groups_dir)
+    empty_groups.save(force=True)
+    empty_path = empty_groups_dir / "data.json"
+    empty_payload = json.loads(empty_path.read_text(encoding="utf-8"))
+    empty_payload["groups"] = []
+    empty_path.write_text(json.dumps(empty_payload), encoding="utf-8")
+    empty_recovered = _fresh(empty_groups_dir)
+    check("空分组数据恢复默认分组并留档",
+          len(empty_recovered.groups) == 3
+          and bool(list(empty_groups_dir.glob("data.corrupt-*.json"))))
+
+    # 模拟原子替换失败，确认失败状态对调用方可见且可以重试。
+    from shiguang import store as store_module
+
+    save_probe = _fresh(tmp / "t7-save-failure")
+    save_probe.add_task("写入失败探针", save_probe.groups[0].id)
+    real_replace = store_module.os.replace
+    try:
+        store_module.os.replace = lambda *_a, **_k: (_ for _ in ()).throw(
+            PermissionError("simulated write failure"))
+        failed = save_probe.save()
+    finally:
+        store_module.os.replace = real_replace
+    check("保存失败有明确返回值并保留待保存状态",
+          failed is False and save_probe.dirty and bool(save_probe.last_save_error))
+    check("恢复写入后可重试成功",
+          save_probe.save() is True and not save_probe.dirty)
+
+    backup_probe = _fresh(tmp / "t7-backup-failure")
+    backup_probe.add_task("备份失败探针", backup_probe.groups[0].id)
+    backup_output = tmp / "t7-backup-failure" / "export.json"
+    try:
+        store_module.os.replace = lambda *_a, **_k: (_ for _ in ()).throw(
+            PermissionError("simulated write failure"))
+        try:
+            backup_probe.export_json(backup_output)
+            backup_rejected = False
+        except OSError:
+            backup_rejected = True
+    finally:
+        store_module.os.replace = real_replace
+    check("保存失败时不生成过期备份",
+          backup_rejected and not backup_output.exists())
+
+    undo_store = _fresh(tmp / "t7-undo")
+    undo_task = undo_store.add_task("撤销用已完成任务", undo_store.groups[0].id)
+    undo_store.set_done(undo_task.id, True)
+    completion_total = undo_store.total_completed
+    history_key = _dt.date.today().isoformat()
+    snapshot = undo_task.to_dict()
+    undo_store.remove_task(undo_task.id)
+    restored = undo_store.restore_task(snapshot)
+    check("撤销删除恢复原任务 ID", restored is not None and restored.id == undo_task.id)
+    check("撤销删除恢复完成统计", undo_store.total_completed == completion_total
+          and undo_store.history_get(history_key) == 1)
+    undo_store.save(force=True)
+    check("撤销后的任务重启后仍存在",
+          _fresh(tmp / "t7-undo").task(undo_task.id) is not None)
 
 
 # ---------------------------------------------------------------- 8
@@ -309,6 +423,12 @@ def test_remind(tmp: Path) -> None:
     check("同一任务第二轮不再提醒", svc.evaluate() == [])
     svc.forget(soon.id)
     check("forget 之后可以重新提醒", len(svc.evaluate()) == 1)
+    check("推迟提醒操作可用", svc.snooze(soon.id, 10))
+    check("推迟期间不重复提醒", svc.evaluate() == [])
+    svc._snoozed_until[soon.id] = 0.0
+    check("推迟时间到后重新提醒", len(svc.evaluate()) == 1)
+    restarted = ReminderService(store, lambda *_a: None)
+    check("重启后重新检查未完成的提醒", len(restarted.evaluate()) == 1)
     title, message = ReminderService.build_message([("soon", store.task(soon.id))])
     check("通知文案非空", bool(title) and bool(message), message)
 

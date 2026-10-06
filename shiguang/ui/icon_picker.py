@@ -36,28 +36,27 @@ import tkinter as tk
 from typing import Callable, Optional, Tuple
 
 from .. import icons, theme
+from .window_shape import schedule_rounded_region
 
 # ---- 设计尺寸（逻辑像素，构造时统一换算）----
-COLS = 4
-CELL = 44                 # 格子边长
-GAP = 8                   # 格子间距
-PAD = 12                  # 浮层内边距
-RADIUS = 14               # 浮层圆角
-HEADER = 30               # 标题行高度
-ICON_IN_CELL = 20         # 格子里图标的大小
-ICON_CENTER_Y = 14        # 图标中心距格子顶部的高度
-LABEL_BOTTOM = 3          # 名称文字距格子底部的距离
+COLS = theme.ICON_PICKER_COLS
+CELL = theme.ICON_PICKER_CELL                 # 格子边长
+GAP = theme.ICON_PICKER_GAP                   # 格子间距
+PAD = theme.ICON_PICKER_PAD                  # 浮层内边距
+RADIUS = theme.ICON_PICKER_RADIUS               # 浮层圆角
+HEADER = theme.ICON_PICKER_HEADER               # 标题行高度
+ICON_IN_CELL = theme.ICON_PICKER_ICON_IN_CELL         # 格子里图标的大小
+ICON_CENTER_Y = theme.ICON_PICKER_ICON_CENTER_Y        # 图标中心距格子顶部的高度
+LABEL_BOTTOM = theme.ICON_PICKER_LABEL_BOTTOM          # 名称文字距格子底部的距离
 TITLE = "更换图标"
 
-HOVER_LIGHT = "#FDF0E0"
-HOVER_DARK = "#463829"
 
-FADE_STEPS = 6
-FADE_INTERVAL = 16        # ≈100ms
-WATCH_INTERVAL = 140
-WATCH_MISS_LIMIT = 2      # 连续两拍指针在外才收（给指针穿过接缝留时间）
-WATCH_GRACE_TICKS = 4     # 开场免收拍数（≈560ms）
-SAFE_ZONE = 14
+FADE_STEPS = theme.ICON_PICKER_FADE_STEPS
+FADE_INTERVAL = theme.ICON_PICKER_FADE_INTERVAL        # ≈100ms
+WATCH_INTERVAL = theme.ICON_PICKER_WATCH_INTERVAL
+WATCH_MISS_LIMIT = theme.ICON_PICKER_WATCH_MISS_LIMIT      # 连续两拍指针在外才收（给指针穿过接缝留时间）
+WATCH_GRACE_TICKS = theme.ICON_PICKER_WATCH_GRACE_TICKS     # 开场免收拍数（≈560ms）
+SAFE_ZONE = theme.ICON_PICKER_SAFE_ZONE
 
 ACTIVE: list = []
 
@@ -81,9 +80,11 @@ class IconPickerPopup(tk.Toplevel):
     def __init__(self, master: tk.Misc, on_pick: Callable[[str], None],
                  current: str = "", title: str = TITLE) -> None:
         super().__init__(master)
+        self._app_window = master.winfo_toplevel()
         self.withdraw()
+        self.transient(self._app_window)
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", self._app_topmost())
         try:
             self.attributes("-alpha", 0.0)
         except Exception:  # noqa: BLE001
@@ -122,8 +123,8 @@ class IconPickerPopup(tk.Toplevel):
         self.H = self.HEADER + self.ROWS * self.CELL \
                  + (self.ROWS - 1) * self.GAP + self.PAD
 
-        self.configure(bg=theme.c("card"))
-        self.canvas = tk.Canvas(self, bg=theme.c("card"), highlightthickness=0,
+        self.configure(bg=theme.c("window_border"))
+        self.canvas = tk.Canvas(self, bg=theme.c("window_border"), highlightthickness=0,
                                 bd=0, width=self.W, height=self.H)
         self.canvas.pack(fill="both", expand=True)
 
@@ -135,6 +136,12 @@ class IconPickerPopup(tk.Toplevel):
         # Destroy 上清 after 队列：外部直接 destroy（解释器退出、父窗口销毁）
         # 时也要保证没有野回调指向已销毁的控件
         self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _app_topmost(self) -> bool:
+        try:
+            return bool(self._app_window.store.settings.get("always_on_top", False))
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # 几何
@@ -158,18 +165,17 @@ class IconPickerPopup(tk.Toplevel):
     # ------------------------------------------------------------------
     def _draw(self) -> None:
         from . import widgets
+        from PIL import ImageTk
 
         c = self.canvas
         c.delete("all")
-        border = theme.c("border")
+        border = theme.c("window_border")
         bg = theme.c("card")
-        # 浮层底打上 ``popupbg`` 标签：它必须在**所有**格子之下，
-        # 而格子底色又必须在它**之上**（见 :meth:`_draw_cell` 的说明）。
-        widgets.round_rect(c, 0, 0, self.W, self.H, self.R, fill=border,
-                           outline="", tags=("popupbg",))
-        widgets.round_rect(c, theme.lpx(1), theme.lpx(1), self.W - theme.lpx(1),
-                           self.H - theme.lpx(1), self.R - 1, fill=bg,
-                           outline="", tags=("popupbg",))
+        self._background_photo = ImageTk.PhotoImage(widgets.aa_round_rect(
+            (self.W, self.H), self.R, bg,
+            border=border, border_w=theme.lpx(1)))
+        c.create_image(0, 0, anchor="nw", image=self._background_photo,
+                       tags=("popupbg",))
 
         c.create_text(self.PAD, self.HEADER / 2, text=self._title, anchor="w",
                       fill=theme.c("text"), font=theme.font("group_title"))
@@ -192,7 +198,7 @@ class IconPickerPopup(tk.Toplevel):
             # 设计稿里"当前用的那个图标"跟顶栏"＋ 新建任务"是同一支橘色。
             fill = theme.c("orange")
         elif hovered:
-            fill = HOVER_DARK if theme.is_dark() else HOVER_LIGHT
+            fill = theme.c("menu_hover")
         else:
             fill = theme.c("bg_alt")
         widgets.round_rect(c, x, y, x + self.CELL, y + self.CELL,
@@ -208,7 +214,7 @@ class IconPickerPopup(tk.Toplevel):
 
         if selected:
             # 选中态：柔橘实心上的图标必须转白，否则暖棕图标压在橘色上几乎看不见
-            photo = icons.get_tinted(key, self.ICON, "#FFFFFF")
+            photo = icons.get_tinted(key, self.ICON, theme.c("on_nav"))
         else:
             photo = icons.get(key, self.ICON)
         if photo is not None:
@@ -225,7 +231,7 @@ class IconPickerPopup(tk.Toplevel):
             c.create_text(x + self.CELL / 2,
                           y + self.CELL - self.LABEL_INSET,
                           text=label, anchor="s", tags=(tag,),
-                          fill="#FFFFFF" if selected
+                          fill=theme.c("on_nav") if selected
                           else theme.c("text_muted"),
                           font=theme.font("tiny"))
 
@@ -329,7 +335,7 @@ class IconPickerPopup(tk.Toplevel):
     # 显示 / 关闭
     # ------------------------------------------------------------------
     def show_at(self, x: int, y: int, watch: bool = True) -> None:
-        """在屏幕坐标 ``(x, y)``（**物理像素**）弹出，自动避开屏幕边角。"""
+        """在屏幕坐标 ``(x, y)``（**物理像素**）弹出，并留在应用客户区内。"""
         self.update_idletasks()
         try:
             vx, vy = self.winfo_vrootx(), self.winfo_vrooty()
@@ -340,9 +346,20 @@ class IconPickerPopup(tk.Toplevel):
         margin = theme.lpx(6)
         x = max(vx, min(x, sw - self.W - margin))
         y = max(vy, min(y, sh - self.H - margin))
+        try:
+            host = self._app_window
+            hx, hy = host.winfo_rootx(), host.winfo_rooty()
+            hw, hh = host.winfo_width(), host.winfo_height()
+            if self.W <= hw - margin * 2 and self.H <= hh - margin * 2:
+                x = max(hx + margin, min(x, hx + hw - self.W - margin))
+                y = max(hy + margin, min(y, hy + hh - self.H - margin))
+        except Exception:  # noqa: BLE001
+            pass
         self.geometry(f"{self.W}x{self.H}+{int(x)}+{int(y)}")
         self.deiconify()
-        self.attributes("-topmost", True)
+        schedule_rounded_region(self, self.R)
+        self.attributes("-topmost", self._app_topmost())
+        self.lift()
         if watch:
             ACTIVE.append(self)
             self._watch_miss = 0

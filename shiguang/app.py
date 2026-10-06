@@ -43,7 +43,7 @@ WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五",
 # 顶部行用的是**缩写**：完整"星期四"在 344 宽的窗口里会把切换器挤到边上，
 # 而"周四"两个字已经足够表意。
 WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-NAV_LABELS = {"tasks": "今日", "stats": "光景", "settings": "设置"}
+NAV_LABELS = {"tasks": "任务", "stats": "光景", "settings": "设置"}
 
 log = logging.getLogger("shiguang.app")
 
@@ -116,6 +116,7 @@ class ShiguangApp(ctk.CTk):
         self._hidden = False
         self._last_toggle = 0.0
         self._last_celebrate = 0.0
+        self._save_warning_job: Optional[str] = None
         self._pump_job: Optional[str] = None
         self.page: Optional[ctk.CTkFrame] = None
         self.current_page = "tasks"
@@ -150,6 +151,8 @@ class ShiguangApp(ctk.CTk):
 
         if not settings.get("onboarded", False):
             self.after(400, self.show_onboarding)
+        if self.store.load_warnings:
+            self.after(1100, self._show_data_recovery_notice)
 
     # ==================================================================
     # 窗口
@@ -461,9 +464,59 @@ class ShiguangApp(ctk.CTk):
             return
         try:
             self.store.set_setting(self.GEOMETRY_KEY, geometry)
-            self.store.save()
+            self.save_data()
         except Exception as exc:  # noqa: BLE001
             self.store.log(f"窗口几何保存失败：{exc}")
+
+    def save_data(self, force: bool = False) -> bool:
+        """保存本地数据；失败时保留脏状态并在界面提示，后续操作会再次尝试。"""
+        if self.store.save(force=force):
+            if self._save_warning_job is not None:
+                try:
+                    self.after_cancel(self._save_warning_job)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._save_warning_job = None
+            return True
+
+        if self._save_warning_job is None:
+            try:
+                self._save_warning_job = self.after_idle(self._show_save_warning)
+            except Exception:  # noqa: BLE001
+                self._save_warning_job = None
+        return False
+
+    def _show_save_warning(self) -> None:
+        self._save_warning_job = None
+        if self.store.dirty:
+            self.toast("这次修改还没有保存，请检查磁盘空间或数据目录后重试。",
+                       duration=7000)
+
+    def _show_data_recovery_notice(self) -> None:
+        if self.store.load_warnings:
+            if self.store.recovery_backup_path:
+                message = "本地数据有异常，拾光已尽量恢复；原文件副本已保留在数据目录。"
+            else:
+                message = "本地数据有异常，拾光已尽量恢复；请尽快在设置中备份当前数据。"
+            self.toast(message, duration=8000)
+
+    def _ensure_saved_before_exit(self) -> bool:
+        """退出前强制写盘；失败时让用户重试或留在应用中处理。"""
+        while not self.store.save(force=True):
+            try:
+                self.deiconify()
+                self._hidden = False
+                self.lift()
+            except Exception:  # noqa: BLE001
+                pass
+            retry = messagebox.askretrycancel(
+                "拾光还没有保存",
+                "最近的任务修改仍只在内存中。请检查数据目录权限或磁盘空间，然后重试保存。",
+                parent=self,
+            )
+            if not retry:
+                return False
+        return True
 
     def _geometry_sane(self, geometry: str) -> bool:
         """几何字符串是不是"值得存"的。"""
@@ -510,7 +563,7 @@ class ShiguangApp(ctk.CTk):
         self._sync_nav_compact()
 
     def _sync_nav_compact(self) -> None:
-        """窗口放不下完整导航时隐藏"光景"，保"新建/今日/设置"不重叠。
+        """窗口放不下完整导航时隐藏"光景"，保"新建/任务/设置"不重叠。
 
         判定按**当前窗口逻辑宽**对"日期 + 新建 + 完整导航 + 内边距"的总需求；
         带 10px 迟滞带，避免临界宽度来回横跳。compact 状态没变时
@@ -556,7 +609,7 @@ class ShiguangApp(ctk.CTk):
         for _gk in (self.GEOMETRY_KEY, self.LEGACY_GEOMETRY_KEY):
             if self.store.settings.get(_gk):
                 self.store.settings.pop(_gk, None)
-        self.store.save()
+        self.save_data()
         self.geometry(self._initial_geometry())
 
         # 图标（运行期生成，避免打包时携带二进制资源）
@@ -610,6 +663,12 @@ class ShiguangApp(ctk.CTk):
         self.bind("<Configure>", lambda _e: self._schedule_cursor_reset(), add="+")
         self.bind("<Map>", lambda _e: self._schedule_cursor_reset(), add="+")
         self.bind("<FocusIn>", self._on_root_focus_in, add="+")
+        # 清理旧浮层必须先于控件自身的命令。CTk 5 在按下时执行 command，
+        # CTk 6 在松开时执行；放在普通 toplevel 绑定里会收掉同一点击新建的浮层。
+        self._main_press_tag = f"ShiguangMainPress{id(self)}"
+        self.bind_class(self._main_press_tag, "<Button-1>", self._before_main_press)
+        self.bind("<Map>", self._on_main_widget_map, add="+")
+        self._install_main_press_tag(self)
 
         # overrideredirect 会顺手把窗口从任务栏抹掉，必须把 APPWINDOW 样式
         # 补回来，否则最小化之后用户找不到回来的入口
@@ -756,7 +815,7 @@ class ShiguangApp(ctk.CTk):
         self.max_btn.pack(side="left", padx=2)
         self.hide_btn = widgets.IconButton(
             tools, text="", icon="close", command=self.on_close,
-            size=theme.TITLE_BTN, hover=("#F6E3DF", "#4A2E28"))
+            size=theme.TITLE_BTN, hover=theme.pair("close_hover"))
         self.hide_btn.pack(side="left", padx=2)
         # 需求 9：hover 时 × 变朱红 —— tkinter 按钮没有 icon-hover 联动，手工绑
         self.hide_btn.bind("<Enter>",
@@ -1023,12 +1082,12 @@ class ShiguangApp(ctk.CTk):
     def _on_escape(self, _event=None) -> None:
         """Esc：收浮层 + 复位指针（浮层自己那份 cursor 随它一起消失）。"""
         try:
-            self._close_floating()
+            self._close_floating(reason="esc")
         except Exception:  # noqa: BLE001
             pass
         self.reset_cursor(force=True)
 
-    def _close_floating(self) -> None:
+    def _close_floating(self, reason: str = "replace") -> None:
         """收起所有"悬浮层"：右键菜单 + 图标选择浮层 + 新建任务浮层（需求 ⑥/①）。
 
         为什么要集中一处：它们都是**独立的 overrideredirect 顶层窗口**，各自
@@ -1054,16 +1113,31 @@ class ShiguangApp(ctk.CTk):
                 if getattr(popup, "closed", False):
                     self._quick_popup = None
                 else:
-                    popup.close(reason="esc")
+                    popup.close(reason=reason)
             except Exception:  # noqa: BLE001
                 pass
 
-    def _on_root_press(self, event) -> None:
-        """按下：先收起可能开着的右键菜单，若落在热区则开始手工缩放。"""
+    def _install_main_press_tag(self, widget) -> None:
+        tags = widget.bindtags()
+        if self._main_press_tag not in tags:
+            widget.bindtags((self._main_press_tag, *tags))
+
+    def _on_main_widget_map(self, event) -> None:
         try:
-            self._close_floating()
+            if event.widget.winfo_toplevel() is self:
+                self._install_main_press_tag(event.widget)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _before_main_press(self, _event) -> None:
+        """仅主页面点击先收旧浮层；浮层自身及其子控件不使用这个标签。"""
+        try:
+            self._close_floating(reason="outside-click")
         except Exception:  # noqa: BLE001
             pass
+
+    def _on_root_press(self, event) -> None:
+        """控件执行动作后的主窗口绑定，仅处理缩放与指针。"""
         zone = self._resize_zone(event.x_root, event.y_root)
         if not zone:
             # 在内容区按下 = "点掉了浮层/菜单" —— 顺手把指针复位一次。
@@ -1415,16 +1489,6 @@ class ShiguangApp(ctk.CTk):
         # 描边必须**最后**建：它是根窗口的兄弟控件，靠创建顺序压在所有内容之上
         self._build_window_border()
 
-    def _window_menu(self) -> None:
-        widgets.popup_menu(self.hide_btn, [
-            ("最小化到托盘", self.hide_to_tray),
-            # 统一走 hide_to_tray：直接调 self.withdraw 会让 _hidden 状态失真，
-            # 下次托盘点击就会判断成"窗口还开着"从而再隐藏一次
-            ("隐藏窗口", self.hide_to_tray),
-            None,
-            ("退出拾光", self.quit_app),
-        ])
-
     # ==================================================================
     # 页面
     # ==================================================================
@@ -1500,7 +1564,7 @@ class ShiguangApp(ctk.CTk):
     # ==================================================================
     def on_setting(self, key: str, value: Any) -> None:
         self.store.set_setting(key, value)
-        self.store.save()
+        self.save_data()
         if key == "theme":
             ctk.set_appearance_mode(theme.MODE_MAP.get(value, "System"))
             self._last_dark = theme.is_dark()
@@ -1792,7 +1856,7 @@ class ShiguangApp(ctk.CTk):
         # 1.5.11：专注一律计入每日历史与总数（"自由专注"也算）；
         # 有挂靠任务时才给任务的 pomodoros +1（见 store.add_focus）。
         self.store.add_focus(task_id or "")
-        self.store.save()
+        self.save_data()
         # 轻柔提示 + 3 秒自动消失的 toast（需求 23）
         self.toast("专注结束，休息一下吧", duration=3000)
         if isinstance(self.page, TaskPage):
@@ -1806,10 +1870,13 @@ class ShiguangApp(ctk.CTk):
     # ==================================================================
     def toast(self, message: str, duration: int = 2600,
               anchor: Optional[tk.Misc] = None,
-              celebration: bool = False) -> None:
+              celebration: bool = False,
+              action_label: str = "",
+              action_command: Optional[Callable[[], None]] = None) -> None:
         try:
-            self.toast_widget.show(message, duration, anchor=anchor,
-                                   celebration=celebration)
+            self.toast_widget.show(
+                message, duration, anchor=anchor, celebration=celebration,
+                action_label=action_label, action_command=action_command)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1865,7 +1932,7 @@ class ShiguangApp(ctk.CTk):
             self.onboarding.destroy()
             self.onboarding = None
         self.store.set_setting("onboarded", True)
-        self.store.save()
+        self.save_data()
         self.toast("从第一缕光开始吧")
 
     # ==================================================================
@@ -2053,7 +2120,7 @@ class ShiguangApp(ctk.CTk):
             return
         self._hinted_tray = True
         self.store.set_setting("tray_tip_shown", True)
-        self.store.save()
+        self.save_data()
         message = "拾光已藏在托盘里啦，右键图标可以退出"
         # 窗口已经藏起来了，toast 是看不见的 —— 这里必须用系统通知/托盘气泡
         self._notify("拾光 · 还在陪着你", message)
@@ -2167,6 +2234,8 @@ class ShiguangApp(ctk.CTk):
         """点关闭按钮 / Alt+F4：按设置决定"藏到托盘"还是"真的退出"。"""
         # 关窗口前把几何存下来（force：绕开 maximized 跳过，见 _save_geometry）
         self._save_geometry(force=True)
+        if not self.save_data():
+            return
         if (self.store.settings.get("close_to_tray", True)
                 and self.tray is not None and self.tray.available):
             self.hide_to_tray()      # 首次会提示"拾光已藏在托盘里"
@@ -2183,6 +2252,11 @@ class ShiguangApp(ctk.CTk):
             return
         # 必须在置 _closing 之前存 —— _save_geometry 见到 _closing 就直接返回
         self._save_geometry(force=True)
+        # 把最终还原尺寸一起落盘，并在任何后台服务停止前确认写入成功。
+        geom = self._restore_geom if getattr(self, "_maximized", False) else self.geometry()
+        self.store.set_setting("geometry", geom)
+        if not self._ensure_saved_before_exit():
+            return
         self._closing = True
         if self._pump_job:
             try:
@@ -2200,13 +2274,6 @@ class ShiguangApp(ctk.CTk):
                 self.particles.destroy()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            # 最大化状态下退出：存的是还原前的几何，否则下次启动直接满屏
-            geom = self._restore_geom if getattr(self, "_maximized", False) else self.geometry()
-            self.store.set_setting("geometry", geom)
-            self.store.save(force=True)
-        except Exception:  # noqa: BLE001
-            pass
         try:
             self.hotkey.unregister()
         except Exception:  # noqa: BLE001

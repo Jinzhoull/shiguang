@@ -77,11 +77,12 @@ import customtkinter as ctk
 
 from .. import icons, strings, theme
 from ..models import REMIND_DEFAULT, remind_label
+from .window_shape import schedule_rounded_region
 from . import widgets
 
 # 淡入参数：Toplevel 有真 alpha，可以做真正的透明度动画
-FADE_STEPS = 5
-FADE_INTERVAL = 20        # ≈100ms
+FADE_STEPS = theme.QUICK_ADD_FADE_STEPS
+FADE_INTERVAL = theme.QUICK_ADD_FADE_INTERVAL        # ≈100ms
 
 # 已选截止日期的展示格式（短到不会挤爆单行布局）
 _DUE_FMT = "%m/%d %H:%M"
@@ -96,7 +97,7 @@ class GroupChipStrip(tk.Canvas):
     也不一致）。这里只需要"能拖 / 能滚轮"，不需要滚动条，自己画最省事。
     """
 
-    DRAG_TOLERANCE = 4        # 按下后移动超过这个距离才算"拖动"（逻辑像素）
+    DRAG_TOLERANCE = theme.GROUP_CHIP_DRAG_TOLERANCE        # 按下后移动超过这个距离才算"拖动"（逻辑像素）
 
     def __init__(self, master: tk.Misc, height: int, bg: str) -> None:
         self._ch = theme.lpx(height)
@@ -244,11 +245,12 @@ class QuickAddPopup(tk.Toplevel):
         except Exception:  # noqa: BLE001
             pass
 
-        bg = theme.c("card")
+        bg = theme.c("window_border")
         self.configure(bg=bg)
 
         # ---- 逻辑 → 物理（一次性换算）----
-        self.SHADOW = theme.lpx(theme.POPUP_SHADOW)
+        # 卡片与窗口等大；外侧投影环会让圆角显得比直边更厚。
+        self.SHADOW = 0
         self.R = theme.lpx(theme.POPUP_RADIUS)
         self.W = theme.lpx(theme.POPUP_WIDTH) + self.SHADOW * 2
         self.H = theme.lpx(theme.POPUP_HEIGHT) + self.SHADOW * 2
@@ -272,6 +274,9 @@ class QuickAddPopup(tk.Toplevel):
 
         self._place_below(anchor)
         self.deiconify()
+        # Clip the native Toplevel as well as the painted card so its corners
+        # cannot leak a square patch of the Canvas background.
+        schedule_rounded_region(self, self.R)
         self._fade_in(0)
         # 开场免失焦窗口（必需，不是保险）：
         # 弹出后的头 450ms 里焦点要在 主窗口 → 浮层 → 输入框 之间交接，
@@ -498,7 +503,23 @@ class QuickAddPopup(tk.Toplevel):
             pass
         if hasattr(self, "strip"):
             # chips 的可用宽度 = 内容宽 - 左右内边距
-            self.strip.fit(self.W - self.SHADOW * 2 - theme.lpx(theme.POPUP_RADIUS) * 2)
+            available = (self.W - self.SHADOW * 2
+                         - theme.lpx(theme.POPUP_RADIUS) * 2)
+            self.strip.fit(available)
+            # 芯片不足一整行时，动作按钮原本仍贴着浮层最右侧，视觉上比上方
+            # 最后一个分组多出一截。把按钮组右边缘动态收至最后一枚芯片的边缘；
+            # 芯片需要横滚时则保留视口对齐，不把按钮挤进浮层。
+            if hasattr(self, "actions"):
+                last_chip_gap = (theme.lpx(theme.POPUP_CHIP_GAP)
+                                 if self._chips else 0)
+                visible_content = max(
+                    0, self.strip.needed_width() - last_chip_gap)
+                slack = max(0, available - visible_content)
+                # grid_configure 走 Tk 的原生更新路径，不会像首次 .grid() 那样
+                # 再经过 CTk 的 DPI 缩放，因此这里传已经换算好的物理像素。
+                base_pad = theme.lpx(theme.POPUP_RADIUS)
+                self.actions.grid_configure(
+                    padx=(base_pad, base_pad + slack))
         self._sync_inner_size()
 
     def _max_fit_width(self) -> int:
@@ -547,63 +568,24 @@ class QuickAddPopup(tk.Toplevel):
     # 绘制与布局
     # ------------------------------------------------------------------
     def _draw_background(self) -> None:
-        """圆角卡片 + 投影 + **描边**（全部物理像素）。
-
-        用 tag 统一清理：宽度会在 ``_fit_size`` 之后重画一次，
-        逐条 delete 容易漏掉上一轮画的投影层，留下残影。
-
-        1.5.9 —— 描边为什么重写
-        -----------------------
-        用户报"新建任务浮层的**底部边框没有画出来**、和背景融在一起"。
-        两个原因叠在一起：
-
-        1. **描边用 ``round_rect(outline=…)`` 画不出来**。``round_rect`` 是
-           "两个矩形 + 四个圆"拼的，``outline`` 会把六条边**全部**描一遍，
-           而最后画的椭圆填充又把下半部分的描边盖掉 —— 只剩顶部一条线。
-           现在改成"外圈实心边框色 + 内压一块本体色"，并且整块走 PIL 超采样，
-           圆角与描边都是连续边缘。
-        2. **内容窗口把下边框盖住了**。内容窗口原来是 ``(SHADOW, SHADOW)``
-           起、高 ``H - 2×SHADOW``，而卡片本体只到 ``H - SHADOW - 1`` ——
-           内容比卡片**多伸出去 1px**，右下角还露出一小块白方块。
-           现在内容区由 :meth:`_content_box` 统一给出：四边内衬完全对称，
-           下边缘与卡片本体之间留出 ``POPUP_BODY_INSET``。
-        """
+        """整块抗锯齿卡片直接填满窗口，消除投影造成的厚角。"""
         self.canvas.delete("chrome")
-        shadow = theme.c("shadow")
         bg = theme.c("card")
-        page = theme.c("bg")
-        # 描边色：用专用的浮层描边（比通用 border 更深一点，才压得住投影）
-        try:
-            idx = 1 if theme.is_dark() else 0
-            border = theme.POPUP_BORDER[idx]
-        except Exception:  # noqa: BLE001
-            border = theme.c("border")
-
-        inner_t = theme.POPUP_SHADOW_TINT
-        outer_t = theme.POPUP_SHADOW_TINT_OUT
-        span = max(1, self.SHADOW - 1)
-        for i in range(self.SHADOW):
-            t = i / span if span else 0.0
-            off = theme.lpx(i + 1)
-            # 内层最深、外层最浅 —— 渐隐到几乎看不见，避免出现硬边
-            color = theme.mix(shadow, page, inner_t + (outer_t - inner_t) * t)
-            widgets.round_rect(
-                self.canvas, theme.lpx(2), off,
-                self.W - theme.lpx(2), self.H - theme.lpx(2) + off,
-                self.R, fill=color, outline="", tags=("chrome",))
-        # 卡片本体（最后画，天然盖在投影上）：描边 + 圆角一次性由 PIL 出图
+        border = theme.c("window_border")
+        # 卡片本体和 native Toplevel 取同一大小、同一圆角半径。
         from PIL import ImageTk
 
         body = widgets.aa_round_rect(
-            (self.W - 2, self.H - self.SHADOW - 2), self.R, bg,
+            (self.W, self.H), self.R, bg,
             border=border, border_w=theme.lpx(theme.POPUP_BORDER_W))
         self._body_photo = ImageTk.PhotoImage(body)
-        self.canvas.create_image(1, 1, anchor="nw", image=self._body_photo,
+        self.canvas.create_image(0, 0, anchor="nw", image=self._body_photo,
                                  tags=("chrome",))
 
     def _build_content(self) -> None:
         """输入行 + 分组标签条，嵌在 Canvas 的一个 window 里。"""
-        inner = ctk.CTkFrame(self, fg_color=theme.pair("card"))
+        inner = ctk.CTkFrame(self, fg_color=theme.pair("card"),
+                             bg_color=theme.pair("card"))
         inner.grid_columnconfigure(0, weight=1)
         self.inner = inner
 
@@ -685,6 +667,7 @@ class QuickAddPopup(tk.Toplevel):
         # 1.5.12：行首加常驻快捷键提示 —— Enter/Esc 此前没有任何可见提示，
         # 只能靠猜；辅助色 10px 小字，不与按钮抢注意力。
         actions = ctk.CTkFrame(inner, fg_color="transparent")
+        self.actions = actions
         actions.grid(row=2, column=0, sticky="ew",
                      padx=(theme.POPUP_RADIUS, theme.POPUP_RADIUS),
                      pady=(theme.POPUP_ROW_GAP, theme.POPUP_ROW_GAP))
@@ -775,7 +758,7 @@ class QuickAddPopup(tk.Toplevel):
         try:
             raw = self.app.store.group_icon(group.id) or getattr(group, "icon", "")
             key = icons.resolve_key(raw) or icons.DEFAULT_GROUP_ICON
-            color = "#FFFFFF" if selected else ""
+            color = theme.c("on_nav") if selected else ""
             if color:
                 return icons.get_ctk_tinted(key, theme.POPUP_CHIP_ICON, color)
             return icons.get_ctk(key, theme.POPUP_CHIP_ICON)
@@ -1273,7 +1256,11 @@ class QuickAddPopup(tk.Toplevel):
         dialog = None
         try:
             dialog = DuePickerDialog(self.app, self._due, on_save,
-                                     remind=self._remind)
+                                     remind=self._remind,
+                                     # 弹窗销毁时会经 Destroy 回调恢复这个浮层。
+                                     # 再由基类抬主窗口会把刚恢复的浮层压回去；
+                                     # 这里的焦点归还由 release() 单独处理。
+                                     restore_focus=False)
         except Exception as exc:  # noqa: BLE001
             self._log(f"日期选择器打开失败：{exc}")
             release()

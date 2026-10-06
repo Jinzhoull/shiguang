@@ -4,8 +4,7 @@
 统一约定
 --------
 * 一律用 ``CTkToplevel`` + ``grab_set()`` 做模态，保证主窗口不会被误操作；
-  （唯一例外是 :class:`ConfirmDialog` —— 它自绘标题栏，用裸 ``tk.Toplevel``
-  的 ``overrideredirect`` 窗口，见该类文档）
+* ``_BaseDialog`` 与 :class:`ConfirmDialog` 都使用应用自绘标题栏，避免系统装饰混入。
 * 打开时居中到主窗口，关闭后把焦点还给主窗口（否则快捷键会失效）；
 * 所有对话框都不直接改数据，只把结果通过 ``on_save`` / ``on_ok`` 回调交回调用方。
 """
@@ -24,6 +23,9 @@ from .. import __app_name__, __slogan__, __version__, theme
 from ..models import (PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_MID, PRIORITY_NAMES,
                       REMIND_DEFAULT, Task, remind_label)
 from . import widgets
+from .dropdown import InAppDropdown
+from .window_shape import (attach_native_owner, paint_round_corners,
+                           schedule_rounded_region)
 
 
 def export_tasks_csv(app) -> None:
@@ -73,18 +75,72 @@ def _center_on(win: ctk.CTkToplevel, parent: tk.Misc) -> None:
 
 
 class _BaseDialog(ctk.CTkToplevel):
-    """模态对话框基类。"""
+    """统一暖色、无系统标题栏的模态对话框。"""
 
-    def __init__(self, app, title: str) -> None:
-        super().__init__(app)
+    def __init__(self, app, title: str, owner: Optional[tk.Misc] = None,
+                 restore_focus: bool = True) -> None:
+        self.owner = owner or app
+        self._restore_focus = restore_focus
+        self._base_finished = False
+        self._show_after = None
+        self._show_attempts = 0
+        super().__init__(self.owner)
         self.app = app
+        self._dialog_title = title
+        self._drag_origin = None
+        # 构造期间先隐藏：避免 Toplevel 在默认坐标闪现或留在 owner 后方，
+        # 最终只在 _do_show 中定位、抬到前景并取得模态抓取。
+        self.withdraw()
         self.title(title)
-        self.configure(fg_color=theme.pair("bg"))
+        self.configure(fg_color=theme.pair("window_border"))
         self.resizable(False, False)
-        self.transient(app)
+        self.transient(self.owner)
+        self.overrideredirect(True)
         ctk.set_appearance_mode(theme.MODE_MAP.get(app.store.settings.get("theme", "system"),
                                                    "System"))
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.surface = ctk.CTkFrame(
+            self, corner_radius=theme.RADIUS_MENU, border_width=0,
+            bg_color=theme.pair("window_border"), fg_color=theme.pair("bg"))
+        # CTkFrame 的圆角光栅化会在底边多留约 1 个逻辑像素；底部少缩进
+        # 1px 后，原生窗口的描边在四边及四角才等宽。
+        self.surface.grid(row=0, column=0, sticky="nsew")
+        # grid_configure 使用物理像素；四边固定 2px，不受 150% 缩放的
+        # 1→1、2→3 舍入跳变影响。底部保留 1px 给 CTk 自身的额外空行。
+        self.surface.grid_configure(padx=(2, 1), pady=(2, 1))
+        self.surface.grid_columnconfigure(0, weight=1)
+        self.surface.grid_rowconfigure(1, weight=1)
+        self.titlebar = ctk.CTkFrame(self.surface, fg_color="transparent",
+                                     corner_radius=0, height=38)
+        self.titlebar.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=(5, 0))
+        self.titlebar.grid_columnconfigure(1, weight=1)
+        try:
+            from .. import icons
+            self._header_icon = icons.get_ctk("grp_sun", 16)
+        except Exception:  # noqa: BLE001
+            self._header_icon = None
+        self.title_icon = ctk.CTkLabel(
+            self.titlebar, text="", image=self._header_icon, width=18)
+        self.title_icon.grid(row=0, column=0, padx=(0, 5))
+        self.header_title = widgets.TextLabel(
+            self.titlebar, text=title, font=theme.font("small_bold"),
+            text_color=theme.pair("text"), anchor="w")
+        self.header_title.grid(row=0, column=1, sticky="ew")
+        close = widgets.IconButton(
+            self.titlebar, text="", icon="close", icon_size=14, size=26,
+            radius=13, fg="transparent", hover=theme.pair("ghost_hover"),
+            command=self._cancel)
+        close.grid(row=0, column=2, padx=(6, 0))
+        self.body = ctk.CTkFrame(self.surface, fg_color="transparent", corner_radius=0)
+        # 透明子 Frame 实际仍会绘制矩形底色。给底部圆角留出绘制区域，
+        # 否则它会盖住内层圆角，底部边线在两端突然消失。
+        self.body.grid(row=1, column=0, sticky="nsew", padx=1,
+                       pady=(0, theme.lpx(8)))
+        self.body.grid_columnconfigure(0, weight=1)
+        for widget in (self.titlebar, self.title_icon, self.header_title):
+            widget.bind("<Button-1>", self._drag_start, add="+")
+            widget.bind("<B1-Motion>", self._drag_move, add="+")
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self._apply_window_icon(app)
         # Windows 下置顶于父窗口
@@ -93,21 +149,21 @@ class _BaseDialog(ctk.CTkToplevel):
         except Exception:  # noqa: BLE001
             pass
 
+    def _drag_start(self, event) -> None:
+        self._drag_origin = (event.x_root - self.winfo_x(),
+                             event.y_root - self.winfo_y())
+
+    def _drag_move(self, event) -> None:
+        if self._drag_origin is None:
+            return
+        dx, dy = self._drag_origin
+        try:
+            self.geometry(f"+{int(event.x_root - dx)}+{int(event.y_root - dy)}")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _apply_window_icon(self, app) -> None:
-        """给对话框的原生标题栏装上品牌图标。
-
-        主窗口是 ``overrideredirect``（没有原生标题栏），对话框有 —— 于是
-        标题栏左上角露出的是 Tk 的默认图标（一个蓝白方块），跟暖色调完全不搭。
-        ``app.iconbitmap(default=...)`` 设的是"后续新建 toplevel 的默认图标"，
-        实测对 CTkToplevel 不生效，只能自己再设一次。
-
-        ⚠️ 必须用 ``iconbitmap`` 而不是 ``iconphoto``：``CTkToplevel.__init__``
-        排了一个 ``after(200, self._windows_set_titlebar_icon)``，只要用户没调过
-        ``iconbitmap``（CTk 重写它时会立一个 ``_iconbitmap_method_called`` 标志），
-        200ms 后它就把标题栏图标换成 CustomTkinter 自带的
-        ``CustomTkinter_icon_Windows.ico`` —— 也就是那个蓝白方块。用 ``iconphoto``
-        设的图标会在那一拍被吃掉，所以这里以 ``iconbitmap`` 为准。
-        """
+        """保留品牌图标供任务切换器等系统界面使用。"""
         ico = getattr(app, "_icon_ico", None)
         if ico:
             try:
@@ -123,30 +179,120 @@ class _BaseDialog(ctk.CTkToplevel):
                 pass
 
     def _finish(self) -> None:
+        if self._base_finished:
+            return
+        self._base_finished = True
+        if self._show_after is not None:
+            try:
+                self.app.after_cancel(self._show_after)
+            except Exception:  # noqa: BLE001
+                pass
+            self._show_after = None
         try:
             self.grab_release()
         except Exception:  # noqa: BLE001
             pass
-        parent = self.app
+        owner = self.owner
         self.destroy()
+        if not self._restore_focus:
+            return
+
+        def restore_owner() -> None:
+            try:
+                if not owner.winfo_exists() or not owner.winfo_viewable():
+                    return
+                owner.lift()
+                # 嵌套模态（例如任务编辑里的截止日期）关闭后，恢复仍打开的父对话框
+                # 的 grab；否则日期页一关，父窗口会留在屏幕后面且主窗口被锁住。
+                if owner is not self.app:
+                    owner.grab_set()
+                owner.focus_force()
+            except Exception:  # noqa: BLE001
+                # 关闭弹窗后至少确保应用根窗口不保留已销毁窗口的模态抓取。
+                try:
+                    if self.app.winfo_exists():
+                        self.app.grab_release()
+                except Exception:  # noqa: BLE001
+                    pass
+
         try:
-            parent.focus_force()
-            parent.lift()
+            # 等系统处理完子窗口销毁，再把 grab/focus 交回父窗口。同步交接会在
+            # Windows 上偶发让刚销毁的子窗口继续持有模态状态。
+            self.app.after_idle(restore_owner)
         except Exception:  # noqa: BLE001
-            pass
+            restore_owner()
 
     def _cancel(self) -> None:
         self._finish()
 
     def show(self) -> None:
-        self.after(10, self._do_show)
+        self._show_attempts = 0
+        # These dialogs open in response to an active UI action. Map the fully
+        # positioned window synchronously while its owner is still visible; a
+        # delayed first show can lose a race with startup/z-order callbacks.
+        self._do_show()
+
+    def _schedule_show(self, delay: int = 25) -> None:
+        if self._base_finished:
+            return
+        try:
+            # Schedule on the application root. Some Tk/Windows builds suspend
+            # timers registered by a withdrawn CTkToplevel until it is mapped.
+            self._show_after = self.app.after(delay, self._do_show)
+        except Exception:  # noqa: BLE001
+            self._show_after = None
 
     def _do_show(self) -> None:
-        _center_on(self, self.app)
+        self._show_after = None
+        if self._base_finished:
+            return
+        # Windows may process the initial map request for a transient owner one
+        # event-loop turn after deiconify(). Never install a modal grab until the
+        # owner and this window are actually viewable: grabbing an unmapped
+        # Toplevel leaves the visible app unclickable with no dialog to close.
+        try:
+            if not self.owner.winfo_exists() or not self.owner.winfo_viewable():
+                self._show_attempts += 1
+                if self._show_attempts < 80:
+                    self._schedule_show(25)
+                return
+            _center_on(self, self.owner)
+            self.deiconify()
+            attach_native_owner(self, self.owner)
+            self.lift()
+        except Exception:  # noqa: BLE001
+            self._show_attempts += 1
+            if self._show_attempts < 80:
+                self._schedule_show(25)
+            return
+        try:
+            visible = self.winfo_viewable()
+        except Exception:  # noqa: BLE001
+            visible = False
+        if not visible:
+            self._show_attempts += 1
+            if self._show_attempts < 80:
+                self._schedule_show(25)
+            return
+        schedule_rounded_region(self, theme.lpx(theme.RADIUS_MENU) + 2)
+        paint_round_corners(
+            self, theme.lpx(theme.RADIUS_MENU) + 2, 2,
+            theme.c("bg"), theme.c("window_border"))
         try:
             self.grab_set()
+            # Validate grab ownership. If Tk/Windows rejected it, do not leave a
+            # half-open dialog; retry while visible and otherwise remain passive.
+            grab = self.grab_current()
+            if grab is None or grab.winfo_toplevel()._w != self._w:
+                self._show_attempts += 1
+                if self._show_attempts < 80:
+                    self._schedule_show(25)
+                return
+            self.focus_force()
         except Exception:  # noqa: BLE001
-            pass
+            self._show_attempts += 1
+            if self._show_attempts < 80:
+                self._schedule_show(25)
 
 
 # --------------------------------------------------------------------------
@@ -163,49 +309,47 @@ class TaskDialog(_BaseDialog):
         self.on_save = on_save
 
         pad = {"padx": 20}
-        ctk.CTkLabel(self, text="任务内容", font=theme.font("small"),
+        ctk.CTkLabel(self.body, text="任务内容", font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=0, column=0, sticky="w", pady=(18, 4), **pad)
 
         self.title_entry = ctk.CTkEntry(
-            self, font=theme.font("body"), height=38, corner_radius=12,
-            fg_color=theme.pair("card"), border_color=theme.pair("border"),
+            self.body, font=theme.font("body"), height=38, corner_radius=12,
+            fg_color=theme.pair("card"), border_color=theme.pair("control_border"),
             text_color=theme.pair("text"), placeholder_text="想做的事…",
         )
         self.title_entry.grid(row=1, column=0, sticky="ew", **pad)
         self.title_entry.insert(0, task.title if task else "")
 
         # ---- 分组 ----
-        ctk.CTkLabel(self, text="分组", font=theme.font("small"),
+        ctk.CTkLabel(self.body, text="分组", font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=2, column=0, sticky="w", pady=(14, 4), **pad)
         self._group_ids = [g.id for g in app.store.groups]
-        names = [f"{g.icon} {g.name}" for g in app.store.groups]
+        names = [g.name for g in app.store.groups]
+        group_icons = [app.store.group_icon(g.id) or g.icon
+                       for g in app.store.groups]
         current = task.group_id if task else (preset_group or app.store.settings.get("default_group"))
         if current not in self._group_ids:
             current = self._group_ids[0] if self._group_ids else ""
         index = self._group_ids.index(current) if current in self._group_ids else 0
-        self.group_menu = ctk.CTkOptionMenu(
-            self, values=names or ["默认"], height=34, corner_radius=12,
-            fg_color=theme.pair("ghost"), button_color=theme.pair("border"),
-            button_hover_color=theme.pair("ghost_hover"),
-            text_color=theme.pair("text"), font=theme.font("small"),
-            dropdown_fg_color=theme.pair("card"),
-            dropdown_text_color=theme.pair("text"),
-            dropdown_hover_color=theme.pair("accent_soft"),
+        self.group_menu = InAppDropdown(
+            self.body, values=names or ["默认"], height=34, width=320,
+            min_popup_width=240, title="选择分组", anchor="w",
+            value_icons=group_icons,
         )
         if names:
-            self.group_menu.set(names[index])
+            self.group_menu.set_index(index)
         self.group_menu.grid(row=3, column=0, sticky="ew", **pad)
 
         # ---- 优先级 ----
-        ctk.CTkLabel(self, text="优先级", font=theme.font("small"),
+        ctk.CTkLabel(self.body, text="优先级", font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=4, column=0, sticky="w", pady=(14, 4), **pad)
         self.priority_var = ctk.StringVar(
             value=PRIORITY_NAMES.get(task.priority if task else PRIORITY_MID, "中"))
         self.priority_seg = ctk.CTkSegmentedButton(
-            self, values=["高", "中", "低"], variable=self.priority_var,
+            self.body, values=["高", "中", "低"], variable=self.priority_var,
             font=theme.font("small"), height=34,
             fg_color=theme.pair("ghost"),
             selected_color=theme.pair("accent"),
@@ -217,7 +361,7 @@ class TaskDialog(_BaseDialog):
         self.priority_seg.grid(row=5, column=0, sticky="ew", **pad)
 
         # ---- 截止日期 ----
-        ctk.CTkLabel(self, text="截止日期", font=theme.font("small"),
+        ctk.CTkLabel(self.body, text="截止日期", font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=6, column=0, sticky="w", pady=(14, 4), **pad)
         self._due = task.due_date if task else None
@@ -225,7 +369,7 @@ class TaskDialog(_BaseDialog):
         # 这里只保存状态，真正的选择器在截止日期弹窗里（时间行下方）。
         self._remind = (task.remind_offset if task is not None
                         else REMIND_DEFAULT)
-        due_row = ctk.CTkFrame(self, fg_color="transparent")
+        due_row = ctk.CTkFrame(self.body, fg_color="transparent")
         due_row.grid(row=7, column=0, sticky="ew", **pad)
         due_row.grid_columnconfigure(0, weight=1)
         # 日历图标走自绘（需求 14：不用 emoji），用 compound="left" 把图和字拼起来
@@ -251,12 +395,12 @@ class TaskDialog(_BaseDialog):
         self._sync_due_button()
 
         # ---- 备注 ----
-        ctk.CTkLabel(self, text="备注（可选）", font=theme.font("small"),
+        ctk.CTkLabel(self.body, text="备注（可选）", font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=8, column=0, sticky="w", pady=(14, 4), **pad)
         self.note_box = ctk.CTkTextbox(
-            self, height=64, corner_radius=12, font=theme.font("small"),
-            fg_color=theme.pair("card"), border_color=theme.pair("border"),
+            self.body, height=64, corner_radius=12, font=theme.font("small"),
+            fg_color=theme.pair("card"), border_color=theme.pair("control_border"),
             border_width=1, text_color=theme.pair("text"),
         )
         self.note_box.grid(row=9, column=0, sticky="ew", **pad)
@@ -264,7 +408,7 @@ class TaskDialog(_BaseDialog):
             self.note_box.insert("1.0", task.note)
 
         # ---- 按钮 ----
-        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons = ctk.CTkFrame(self.body, fg_color="transparent")
         buttons.grid(row=10, column=0, sticky="ew", pady=(18, 18), **pad)
         buttons.grid_columnconfigure(0, weight=1)
 
@@ -274,7 +418,7 @@ class TaskDialog(_BaseDialog):
                       command=self._cancel).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(buttons, text="保存", width=88, height=36, corner_radius=18,
                       fg_color=theme.pair("accent"), hover_color=theme.pair("accent_hover"),
-                      text_color=("#FFFFFF", "#2D2A26"), font=theme.font("small"),
+                      text_color=theme.ON_ACCENT, font=theme.font("small"),
                       command=self._save).grid(row=0, column=2)
 
         self.title_entry.bind("<Return>", lambda _e: self._save())
@@ -303,7 +447,7 @@ class TaskDialog(_BaseDialog):
         from . import due_picker
 
         due_picker.pick_due(self.app, self._due, self._on_due_picked,
-                            remind=self._remind)
+                            remind=self._remind, owner=self)
 
     def _on_due_picked(self, when, remind=None) -> None:
         self._due = when
@@ -319,12 +463,10 @@ class TaskDialog(_BaseDialog):
         if not title:
             self.title_entry.configure(border_color=theme.pair("danger"))
             return
-        name = self.group_menu.get()
-        group_id = self._group_ids[0] if self._group_ids else ""
-        for gid, grp in zip(self._group_ids, self.app.store.groups):
-            if f"{grp.icon} {grp.name}" == name:
-                group_id = gid
-                break
+        group_index = self.group_menu.get_index()
+        group_id = (self._group_ids[group_index]
+                    if 0 <= group_index < len(self._group_ids)
+                    else (self._group_ids[0] if self._group_ids else ""))
         priority = {"高": PRIORITY_HIGH, "中": PRIORITY_MID, "低": PRIORITY_LOW}.get(
             self.priority_var.get(), PRIORITY_MID)
         fields = {
@@ -392,14 +534,17 @@ class ConfirmDialog(tk.Toplevel):
                             bool(app.store.settings.get("always_on_top", False)))
         except Exception:  # noqa: BLE001
             pass
-        self.configure(bg=theme.c("bg"))
+        self.configure(bg=theme.c("window_border"))
 
         card = ctk.CTkFrame(
-            self, fg_color=theme.pair("card"), bg_color=theme.pair("bg"),
+            self, fg_color=theme.pair("card"),
+            bg_color=theme.pair("window_border"),
             corner_radius=theme.CONFIRM_RADIUS,
-            border_width=1, border_color=theme.pair("border"),
+            border_width=0,
         )
+        # 与普通对话框共用同一物理外框，避免 CTk 的底边比顶边粗。
         card.pack(fill="both", expand=True)
+        card.pack_configure(padx=(2, 1), pady=(2, 1))
         card.grid_columnconfigure(0, weight=1)
         self.card = card
 
@@ -493,10 +638,15 @@ class ConfirmDialog(tk.Toplevel):
         self._place()
         try:
             self.deiconify()
+            attach_native_owner(self, self.app)
             self.lift()
             self.grab_set()
         except Exception:  # noqa: BLE001
             pass
+        schedule_rounded_region(self, theme.lpx(theme.CONFIRM_RADIUS) + 2)
+        paint_round_corners(
+            self, theme.lpx(theme.CONFIRM_RADIUS) + 2, 2,
+            theme.c("card"), theme.c("window_border"))
         # 截图 / 预览等场景不抢焦点（与 app 的"启动抢前台"同一套开关）
         if self._may_activate():
             try:
@@ -611,16 +761,16 @@ class PromptDialog(_BaseDialog):
                  on_ok: Callable[[str], None]) -> None:
         super().__init__(app, title)
         self.on_ok = on_ok
-        ctk.CTkLabel(self, text=label, font=theme.font("small"),
+        ctk.CTkLabel(self.body, text=label, font=theme.font("small"),
                      text_color=theme.pair("text_muted")).grid(
             row=0, column=0, sticky="w", padx=20, pady=(20, 6))
-        self.entry = ctk.CTkEntry(self, font=theme.font("body"), height=36,
+        self.entry = ctk.CTkEntry(self.body, font=theme.font("body"), height=36,
                                   corner_radius=12, fg_color=theme.pair("card"),
-                                  border_color=theme.pair("border"),
+                                  border_color=theme.pair("control_border"),
                                   text_color=theme.pair("text"))
         self.entry.grid(row=1, column=0, sticky="ew", padx=20)
         self.entry.insert(0, initial)
-        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons = ctk.CTkFrame(self.body, fg_color="transparent")
         buttons.grid(row=2, column=0, sticky="ew", padx=20, pady=(16, 18))
         buttons.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(buttons, text="取消", width=80, height=34, corner_radius=17,
@@ -629,7 +779,7 @@ class PromptDialog(_BaseDialog):
                       command=self._cancel).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(buttons, text="保存", width=80, height=34, corner_radius=17,
                       fg_color=theme.pair("accent"), hover_color=theme.pair("accent_hover"),
-                      text_color=("#FFFFFF", "#2D2A26"), font=theme.font("small"),
+                      text_color=theme.ON_ACCENT, font=theme.font("small"),
                       command=self._ok).grid(row=0, column=2)
         self.entry.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self._cancel())
@@ -655,32 +805,32 @@ def prompt(app, title: str, label: str, initial: str,
 class AboutDialog(_BaseDialog):
     def __init__(self, app) -> None:
         super().__init__(app, f"关于{__app_name__}")
-        self.grid_columnconfigure(0, weight=1)
+        self.body.grid_columnconfigure(0, weight=1)
 
-        mark = tk.Canvas(self, width=110, height=110, bg=theme.c("bg"),
+        mark = tk.Canvas(self.body, width=110, height=110, bg=theme.c("bg"),
                          highlightthickness=0, bd=0)
         mark.grid(row=0, column=0, pady=(22, 4))
         self._draw_sun(mark, 110)
         mark.bind("<Button-1>", lambda _e: self._spin(mark, 0))
 
-        ctk.CTkLabel(self, text=__app_name__, font=theme.font("title"),
+        ctk.CTkLabel(self.body, text=__app_name__, font=theme.font("title"),
                      text_color=theme.pair("text")).grid(row=1, column=0)
-        ctk.CTkLabel(self, text=f"v{__version__}", font=theme.font("tiny"),
+        ctk.CTkLabel(self.body, text=f"v{__version__}", font=theme.font("tiny"),
                      text_color=theme.pair("text_muted")).grid(row=2, column=0, pady=(0, 2))
-        ctk.CTkLabel(self, text=__slogan__, font=theme.font("h2"),
+        ctk.CTkLabel(self.body, text=__slogan__, font=theme.font("h2"),
                      text_color=theme.pair("accent")).grid(row=3, column=0, pady=(6, 2))
         ctk.CTkLabel(
-            self,
+            self.body,
             text="谢谢你愿意把每一天的光，交给拾光来收藏。\n愿你在这里拾起的每一缕，都算数。",
             font=theme.font("small"), text_color=theme.pair("text_muted"),
             justify="center",
         ).grid(row=4, column=0, padx=26, pady=(10, 4))
-        ctk.CTkLabel(self, text="数据保存在你的电脑里，不上传任何服务器。",
+        ctk.CTkLabel(self.body, text="数据保存在你的电脑里，不上传任何服务器。",
                      font=theme.font("tiny"),
                      text_color=theme.pair("text_done")).grid(row=5, column=0, pady=(2, 0))
-        ctk.CTkButton(self, text="好", width=110, height=34, corner_radius=17,
+        ctk.CTkButton(self.body, text="好", width=110, height=34, corner_radius=17,
                       fg_color=theme.pair("accent"), hover_color=theme.pair("accent_hover"),
-                      text_color=("#FFFFFF", "#2D2A26"), font=theme.font("small"),
+                      text_color=theme.ON_ACCENT, font=theme.font("small"),
                       command=self._cancel).grid(row=6, column=0, pady=(16, 20))
         self.bind("<Escape>", lambda _e: self._cancel())
         self.show()

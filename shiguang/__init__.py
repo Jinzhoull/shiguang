@@ -7,7 +7,7 @@
 
 __app_name__ = "拾光"
 __app_name_en__ = "Shiguang"
-__version__ = "1.5.30"
+__version__ = "1.5.42"
 __slogan__ = "拾起每一天，不负好时光"
 __author__ = "拾光"
 

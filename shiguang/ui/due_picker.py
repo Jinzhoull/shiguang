@@ -280,8 +280,10 @@ class DuePickerDialog(_BaseDialog):
 
     def __init__(self, app, when: Optional[_dt.datetime] = None,
                  on_save: Optional[Callable[..., None]] = None,
-                 remind: Optional[int] = None) -> None:
-        super().__init__(app, "截止日期")
+                 remind: Optional[int] = None, owner: Optional[tk.Misc] = None,
+                 restore_focus: bool = True) -> None:
+        super().__init__(app, "截止日期", owner=owner,
+                         restore_focus=restore_focus)
         self.on_save = on_save
         # 提醒提前量（分钟）：None = 不提醒。回调统一按 (when, remind) 两参返回。
         self._remind: Optional[int] = parse_remind(remind)
@@ -299,12 +301,12 @@ class DuePickerDialog(_BaseDialog):
 
         # 全部是**逻辑像素**：CTk 控件自己会缩放，传 lpx() 就是双重放大。
         pad = {"padx": theme.DUE_PAD_X}
-        self.grid_columnconfigure(0, weight=1)
+        self.body.grid_columnconfigure(0, weight=1)
 
         # 表头行（星期）在时间模式下会被 grid_remove()，靠这一行 minsize 兜住
         # 高度 —— 否则弹窗会在"日期 ↔ 数字"切换时上下跳一下。grid 的 minsize
         # 是**物理**像素，要过 lpx()。
-        self.grid_rowconfigure(1, minsize=theme.lpx(theme.DUE_WEEKDAY_H))
+        self.body.grid_rowconfigure(1, minsize=theme.lpx(theme.DUE_WEEKDAY_H))
 
         # ---------------- 顶部：月份切换 / 时间模式返回 ----------------
         # 1.5.21：三列**等权 + 左右列同 minsize**（左按钮 | 标题 | 右按钮）。
@@ -312,7 +314,7 @@ class DuePickerDialog(_BaseDialog):
         # 被挤偏。但仅等权还不够 —— 等权只均分**多余**空间，左列请求宽
         # （返回按钮 ~50）与右列（0）不同，列宽仍不相等，标题偏右一个按钮宽。
         # 左右列取同一个 minsize（≥ 返回按钮宽）后两列恒等宽，标题绝对居中。
-        head = ctk.CTkFrame(self, fg_color="transparent")
+        head = ctk.CTkFrame(self.body, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew",
                   pady=(theme.DUE_PAD_TOP, theme.DUE_ROW_GAP), **pad)
         for col in (0, 1, 2):
@@ -336,7 +338,7 @@ class DuePickerDialog(_BaseDialog):
         self.month_label.grid(row=0, column=1)
 
         # ---------------- 星期表头 ----------------
-        self.header = ctk.CTkFrame(self, fg_color="transparent")
+        self.header = ctk.CTkFrame(self.body, fg_color="transparent")
         self.header.grid(row=1, column=0, sticky="ew", **pad)
         self.weekday_labels: List[ctk.CTkLabel] = []
         for i in range(7):
@@ -347,7 +349,7 @@ class DuePickerDialog(_BaseDialog):
             self.weekday_labels.append(lab)
 
         # ---------------- 网格区（日期 / 小时 / 分钟 共用）----------------
-        self.grid_holder = ctk.CTkFrame(self, fg_color="transparent")
+        self.grid_holder = ctk.CTkFrame(self.body, fg_color="transparent")
         self.grid_holder.grid(row=2, column=0, sticky="ew", **pad)
         # 行高固定：既让日历不随月份跳动，也让数字网格与日历区等高
         for r in range(GRID_ROWS):
@@ -357,7 +359,7 @@ class DuePickerDialog(_BaseDialog):
         # ---------------- 时间 ----------------
         # 1.5.22：恢复**贴左**（1.5.21 曾把本行居中，用户明确要求改回）。
         # 字段行与"提醒"行同构贴左，只有顶部标题保持绝对居中（1.5.21）。
-        time_row = ctk.CTkFrame(self, fg_color="transparent")
+        time_row = ctk.CTkFrame(self.body, fg_color="transparent")
         time_row.grid(row=3, column=0, sticky="w",
                       pady=(theme.DUE_ROW_GAP, 0), **pad)
         widgets.TextLabel(time_row, text="时间", font=theme.font("tiny"),
@@ -381,7 +383,7 @@ class DuePickerDialog(_BaseDialog):
         #   corner_radius 而半高差 1，两条弧不同心，橙色全堆在两端成粗边；
         # * 1.5.4 去掉描边环、只留柔橘文字 → 字段本身好看了，**展开的面板**
         #   还是原生菜单，用户一眼就看出"白底黑字 + 硬边框 + 阴影"。
-        remind_row = ctk.CTkFrame(self, fg_color="transparent")
+        remind_row = ctk.CTkFrame(self.body, fg_color="transparent")
         remind_row.grid(row=4, column=0, sticky="w",
                         pady=(theme.DUE_ROW_GAP, 0), **pad)
         widgets.TextLabel(remind_row, text="提醒", font=theme.font("tiny"),
@@ -395,7 +397,7 @@ class DuePickerDialog(_BaseDialog):
         # 少一个按钮后本行的请求宽度降到 ~226 逻辑像素，不再是本弹窗最宽的一行
         # （原本 5 个按钮撑到 ~306，把弹窗宽度顶到下限 DUE_MIN_W 以上）；
         # 宽度回到 300 的同时，剩下的按钮按 weight 均分，行内观感不变。
-        quick = ctk.CTkFrame(self, fg_color="transparent")
+        quick = ctk.CTkFrame(self.body, fg_color="transparent")
         quick.grid(row=5, column=0, sticky="ew",
                    pady=(theme.DUE_ROW_GAP, 0), **pad)
         for i, (label, days) in enumerate((("今天", 0), ("明天", 1), ("后天", 2))):
@@ -418,7 +420,7 @@ class DuePickerDialog(_BaseDialog):
         ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
         # ---------------- 按钮 ----------------
-        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons = ctk.CTkFrame(self.body, fg_color="transparent")
         buttons.grid(row=6, column=0, sticky="ew",
                      pady=(theme.DUE_ROW_GAP + 2, theme.DUE_PAD_BOTTOM), **pad)
         buttons.grid_columnconfigure(0, weight=1)
@@ -705,7 +707,7 @@ class DuePickerDialog(_BaseDialog):
 
 def pick_due(app, when: Optional[_dt.datetime] = None,
              on_save: Optional[Callable[..., None]] = None,
-             remind: Optional[int] = None) -> None:
+             remind: Optional[int] = None, owner: Optional[tk.Misc] = None) -> None:
     """打开截止日期选择器。
 
     ``on_save`` 的签名是 ``(when, remind)``：``when`` 为 ``None`` 表示清除
@@ -713,4 +715,4 @@ def pick_due(app, when: Optional[_dt.datetime] = None,
     在界面上就挨着（提醒行在时间行下方），分两次回调反而容易出现
     "日期改了、提醒没跟上"的半截状态。
     """
-    DuePickerDialog(app, when=when, on_save=on_save, remind=remind)
+    DuePickerDialog(app, when=when, on_save=on_save, remind=remind, owner=owner)

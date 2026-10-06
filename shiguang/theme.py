@@ -37,6 +37,9 @@ LIGHT: Dict[str, str] = {
     # 那样"已完成"的绿底一悬停就消失，等于状态提示被鼠标盖掉。同色相压深一档。
     "card_done_hover": "#D6EACB",
     "border": "#EDE4D6",
+    # 可交互字段的轮廓比卡片分隔线更清楚：搜索、文本输入和下拉框使用这档，
+    # 普通信息卡仍用上面的轻边线，避免整页变成一格一格的重框。
+    "control_border": "#D8C6AE",
     # 窗口最外圈描边（1.5.2 新增）。主窗口是 overrideredirect + 纯白卡片，
     # 在白色/浅灰的桌面或别的软件窗口上完全糊在一起 —— 用户报"分不出边界"。
     # 取值理由：暖白底 #FAF7F2 相对亮度 0.93、卡片纯白 1.0，两者与任何浅色
@@ -63,6 +66,7 @@ LIGHT: Dict[str, str] = {
     "danger": "#C9553D",
     "ghost": "#F1EAE0",
     "ghost_hover": "#E9E1D4",
+    "close_hover": "#F6E3DF",
     "knob": "#FFFFFF",        # 开关旋钮（必须与轨道形成对比，否则深色下看不清）
     "ring": "#E5DAC8",
     "track": "#F0E8DA",
@@ -102,18 +106,18 @@ LIGHT: Dict[str, str] = {
     "banner_soon_bottom": "#F8E0BC",  # 今日到期：下道
     "banner_soon_border": "#E9C894",
     "banner_soon_text": "#8A5A1E",    # 今日到期：标题/强调文字（4.66:1）
-    "banner_item_date": "#7E6E60",    # 明细里的日期：暖灰**弱化**（3.4:1，够读不抢眼）
+    "banner_item_date": "#6B594C",    # 暖灰日期：在下层渐色上仍超过 4.5:1
     # 横幅左侧图标（1.5.29）：琥珀黄填充 + 深橘描边 + 白感叹号。
     # 浅底上"白描边空心三角"太单薄，实心暖黄才有警示的分量。
     "banner_icon_fill": "#F5B93F",
     "banner_icon_glow": "#FBD57F",    # 三角内左上角的微弱高光
     "banner_icon_edge": "#B0651A",    # 深橘描边（同时对浅底和黄填充都能画出轮廓）
-    "banner_icon_mark": "#FFFFFF",
+    "banner_icon_mark": "#6D4214",   # 深琥珀标记：黄底上 4.88:1，细 Logo 仍清晰
     # ---- 悬停提示（1.5.29）----
     # 从"纯白方框"改成米白卡：底色比 card 暖一档，压柔橘细描边，
     # 字色仍用深灰棕（不用纯黑）。
     "tooltip_bg": "#FDF8F0",
-    "tooltip_border": "#E5C9A0",
+    "tooltip_border": "#E0A868",
     "tooltip_text": "#4A4036",
 }
 
@@ -127,6 +131,7 @@ DARK: Dict[str, str] = {
     "card_done": "#26331F",
     "card_done_hover": "#33402F",   # 1.5.24：已完成 + 悬停
     "border": "#45403A",
+    "control_border": "#62564A",
     # 深色下同理：深灰底 #2B2825 与深色桌面/深色编辑器几乎同色，
     # 用暖橘压深（对底对比度 2.1:1）做窗口边界。
     "window_border": "#6E5638",
@@ -147,6 +152,7 @@ DARK: Dict[str, str] = {
     "danger": "#D96A54",
     "ghost": "#3F3A35",
     "ghost_hover": "#4A443E",
+    "close_hover": "#4A2E28",
     "knob": "#F2E9D8",
     "ring": "#4A443C",
     "track": "#413B35",
@@ -186,6 +192,18 @@ DARK: Dict[str, str] = {
 MODE_MAP = {"system": "System", "light": "Light", "dark": "Dark"}
 MODE_LABEL = {"system": "跟随系统", "light": "浅色", "dark": "深色"}
 
+
+# 组件语义色：菜单与提示统一在这里取色，不在绘制模块另立调色板。
+for palette, menu_hover in ((LIGHT, "#FDF0E0"), (DARK, "#463829")):
+    palette.update({
+        "menu_hover": menu_hover,
+        "on_nav": "#FFFFFF",
+        "toast_bg": palette["tooltip_bg"],
+        "toast_text": palette["tooltip_text"],
+        "toast_border": palette["orange"],
+        "particle_spark": "#F5D76E",
+        "particle_fade": "#FCEABB",
+    })
 
 # --------------------------------------------------------------------------
 # 几何与间距（需求 2/3/24/32 —— 集中管理，UI 代码不许出现裸数字）
@@ -383,26 +401,32 @@ BANNER_BULLET_GAP = 7          # 符号与标题的间距
 BANNER_TITLE_GAP = 8           # 标题与日期之间的间距
 BANNER_DATE_FONT_DELTA = -1    # 日期比明细正文再小一档（11 → 10px）
 
-# ---- 悬停提示（1.5.29）----
-# 从"纯白方框"改成米白卡：圆角 + 柔橘细描边 + 轻微投影 + 深灰棕字。
-# 整块由 PIL 出图（圆角/描边/投影/文字同一条渲染路径），Canvas 只贴一张
-# RGBA 位图 —— 与 DueBanner 同一套做法，避免 Tk 图元的硬阶梯与 ClearType 彩边。
+# ---- 无阴影提示卡（Canvas 位图 + 原生圆角窗口，不使用颜色键）----
+BITMAP_SS = 4
 TOOLTIP_RADIUS = 8        # 圆角
 TOOLTIP_PAD_X = 10        # 文字左右内边距
 TOOLTIP_PAD_Y = 6         # 文字上下内边距
-TOOLTIP_SHADOW = 4        # 投影向外扩张的层数（同样也是四周留边，逻辑像素）
-TOOLTIP_SHADOW_ALPHA = 44  # 投影最内层的不透明度（0-255），向外递减到 0
 TOOLTIP_BORDER_W = 1      # 描边宽度（逻辑像素）
 TOOLTIP_MIN_W = 40        # 极短文案也不至于缩成一个小点
-
-# 色键（1.5.30）：位图四周的投影留边在 Canvas 上会被铺成**方形**，
-# 叠在白卡片上就是一圈灰色方框（用户报的"外层还有系统灰框"）。
-# Toplevel 本身已是 overrideredirect（无系统边框），问题出在这块方形底。
-# 解法是 Windows 的 `-transparentcolor`：窗口底色与 Canvas 底色都设成这个色键，
-# 位图里 alpha=0 的像素合成出来正好等于它 → 被系统整片抠掉（顺带穿透点击）。
-# 取页面底色而不是自造一个"魔法色"：抠色前的抗锯齿像素（圆角外缘、投影最外层）
-# 是向这个底色过渡的，若用洋红之类，未抠干净的 1px 残边就会泛紫。
-TOOLTIP_KEY_SRC = "bg"
+TOOLTIP_EDGE_PAD = 6
+FLOAT_WATCH_MS = 120
+POPUP_SHAPE_DELAY_MS = 30
+TOAST_RADIUS = 14
+TOAST_BORDER_W = 1
+TOAST_ICON = 18
+TOAST_PAD_X = 16
+TOAST_PAD_Y = 10
+TOAST_GAP = 8
+TOAST_ACTION_W = 50
+TOAST_ACTION_H = 24
+TOAST_MAX_W = 320
+TOAST_EDGE_PAD = 10
+TOAST_BOTTOM_OFFSET = 116
+TOAST_DURATION_MS = 2600
+TOAST_MAX_LINES = 3
+PARTICLE_MAX = 30
+PARTICLE_FRAME_MS = 16
+PARTICLE_DURATION_MS = 1500
 
 # ---- 自绘标题栏（原生标题栏完全隐藏，窗口控制只此一套）----
 TITLE_HEIGHT = 30         # 标题栏高度（40 -> 30）
@@ -648,6 +672,77 @@ EMPTY_ILLUS_H = 96
 # 窗口被拖窄时整句话会直接溢出卡片（截图里"文字被裁"就是这么来的）。
 # 取 268 是"最小窗宽 310 − 两侧 10 页面内边距 − 卡片内边距"的量级。
 EMPTY_WRAP = 268
+
+
+# 菜单、图标面板和任务动画的既有样式参数。
+MENU_WIDTH = 180
+MENU_ROW_HEIGHT = 34
+MENU_ICON_SIZE = 18
+MENU_ICON_TEXT_GAP = 8
+MENU_PAD_X = 12
+MENU_RADIUS = 12
+MENU_SEP_HEIGHT = 9
+MENU_MAX_LABEL_CHARS = 8
+MENU_FADE_STEPS = 6
+MENU_FADE_INTERVAL = 16
+MENU_WATCH_INTERVAL = 120
+MENU_WATCH_MISS_LIMIT = 2
+MENU_SAFE_ZONE = 14
+MENU_MOVE_TOLERANCE = 6
+ICON_PICKER_COLS = 4
+ICON_PICKER_CELL = 44
+ICON_PICKER_GAP = 8
+ICON_PICKER_PAD = 12
+ICON_PICKER_RADIUS = 14
+ICON_PICKER_HEADER = 30
+ICON_PICKER_ICON_IN_CELL = 20
+ICON_PICKER_ICON_CENTER_Y = 14
+ICON_PICKER_LABEL_BOTTOM = 3
+ICON_PICKER_FADE_STEPS = 6
+ICON_PICKER_FADE_INTERVAL = 16
+ICON_PICKER_WATCH_INTERVAL = 140
+ICON_PICKER_WATCH_MISS_LIMIT = 2
+ICON_PICKER_WATCH_GRACE_TICKS = 4
+ICON_PICKER_SAFE_ZONE = 14
+QUICK_ADD_FADE_STEPS = 5
+QUICK_ADD_FADE_INTERVAL = 20
+TASK_FADE_STEPS = 6
+TASK_FADE_INTERVAL = 25
+TASK_TITLE_MIN_WRAP = 72
+TASK_ACTIONS_PAD_X = 4
+GROUP_CHIP_DRAG_TOLERANCE = 4
+ONBOARDING_SUN_SIZE = 108
+TASK_DRAG_THRESHOLD = 5
+BANNER_FADE_STEPS = 45
+BANNER_FADE_INTERVAL = 40
+BANNER_BITMAP_SS = BITMAP_SS
+TASK_CHECK_PATH = ((-0.135, 0.012), (-0.041, 0.113), (0.150, -0.105))
+
+# 图标品牌调色板；图形路径保留在 icons.py。
+ICON_PALETTE = {
+    "orange": "#E89A4A",
+    "gold": "#E8B84A",
+    "deep_gold": "#D4B872",
+    "vermilion": "#E0553F",
+    "red": "#C0392B",
+    "blue": "#6B93C4",
+    "salmon": "#C97B6B",
+    "brown": "#6B5F52",
+    "warm_brown": "#B08D57",
+    "warm_clasp": "#D4B887",
+    "soft_blue": "#7BA3C9",
+    "page_blue": "#A8C4DE",
+    "grass": "#8FB887",
+    "grass_light": "#C2DDBE",
+    "leaf": "#5C9E4A",
+    "tomato_highlight": "#F08070",
+    "heart_light": "#D98A7A"
+}
+ICON_SIZE_MAIN = 18
+ICON_SIZE_GROUP = 16
+ICON_SIZE_SMALL = 14
+ICON_INNER_SHADOW_DARK = 0.16
+ICON_INNER_SHADOW_LIGHT = 0.22
 
 
 def is_dark() -> bool:

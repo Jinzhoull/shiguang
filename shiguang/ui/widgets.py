@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import customtkinter as ctk
 
 from .. import icons, theme
+from .window_shape import apply_rounded_region
 
 
 # --------------------------------------------------------------------------
@@ -69,7 +70,7 @@ def clear(parent: tk.Misc) -> None:
 #
 # 解法与图标一致：PIL **4× 超采样 → LANCZOS 缩小 → 贴 Canvas**。
 # PIL/FreeType 走灰度抗锯齿，没有彩边；缩小的过程把阶梯磨成连续过渡。
-_AA_SS = 4                      # 超采样倍率
+_AA_SS = theme.BITMAP_SS                      # 超采样倍率
 
 
 _AA_CACHE: dict = {}
@@ -138,7 +139,7 @@ class AAText(tk.Canvas):
     版式一致、只是没有抗锯齿 —— 不能因为字体探测失败就不显示日期。
     """
 
-    def __init__(self, master: tk.Misc, bg: str = "#FFFFFF", cursor: str = "",
+    def __init__(self, master: tk.Misc, bg: str = theme.LIGHT["card"], cursor: str = "",
                  **kwargs) -> None:
         super().__init__(master, width=1, height=1, bg=bg,
                          highlightthickness=0, bd=0, **kwargs)
@@ -150,7 +151,7 @@ class AAText(tk.Canvas):
             self.configure(cursor=cursor)
 
     # ------------------------------------------------------------------
-    def set_text(self, text: str, role: str = "meta", color: str = "#000000",
+    def set_text(self, text: str, role: str = "meta", color: str = theme.LIGHT["text"],
                  pill: Optional[str] = None, pill_radius: int = 0,
                  pad_x: int = 0, pad_y: int = 0, strike: bool = False,
                  min_h: int = 0, min_w: int = 0, box_h: int = 0) -> None:
@@ -236,9 +237,8 @@ def aa_round_rect(size: Tuple[int, int], radius: int, fill: str,
     2. 给拼合体加 ``outline`` 时，**六条边每一条都会被描出来**（内部接线、
        两条竖线、两条横线都在），而且最后画上去的椭圆填充会把下半部分的
        描边盖掉 —— 现象正是"浮层底部边框整条消失"。
-    所以描边只能靠"外面画一圈实心边框色、里面再压一块本体色"，配合 PIL 的
-    连续边缘。这也是 ``menu.py`` / ``icon_picker.py`` 的做法，只是那两处
-    用的是 Tk 图元，圆角仍是阶梯。
+    所以描边由同一张 PIL 超采样位图绘制外沿和内沿；菜单、图标选择和
+    快速新建浮层也共用这条绘制路径。
     """
     from PIL import Image, ImageDraw
 
@@ -269,12 +269,8 @@ def aa_round_rect(size: Tuple[int, int], radius: int, fill: str,
     return img
 
 
-def tooltip_key() -> str:
-    """悬停提示透明圆角外沿使用的色键。"""
-    return theme.c(theme.TOOLTIP_KEY_SRC)
-
-
-def tooltip_image(text: str, max_width: Optional[int] = None):
+def tooltip_image(text: str, max_width: Optional[int] = None,
+                  max_height: Optional[int] = None):
     """悬停提示整块位图：米白圆角卡 + 柔橘细描边 + 深灰棕文字。
 
     为什么整块出图（1.5.29）
@@ -285,8 +281,8 @@ def tooltip_image(text: str, max_width: Optional[int] = None):
     所以圆角、描边、文字全部走 PIL 4× 超采样 → LANCZOS，渲染路径只有
     一条（与 ``DueBanner`` 同一套做法）。透明外沿不绘制阴影或矩形底框。
 
-    返回 ``(PIL.Image, (逻辑宽, 逻辑高))``；字体层不可用时返回 ``None``，
-    调用方自行降级（退回单色方框，至少不崩）。
+    返回 ``(PIL.Image, (物理宽, 物理高))``；字体层不可用时返回 ``None``，
+    调用方用无高亮 Canvas 降级绘制。
     """
     from PIL import Image, ImageColor, ImageDraw
 
@@ -328,8 +324,19 @@ def tooltip_image(text: str, max_width: Optional[int] = None):
     draw = ImageDraw.Draw(img, "RGBA")
     radius = min(theme.lpx(theme.TOOLTIP_RADIUS) * ss, (h - 1) // 2, (w - 1) // 2)
 
-    # 只画提示卡自身。外沿保持 alpha=0，交由 Toplevel 色键透出底层，
-    # 不再绘制投影或占位边距，避免圆角卡外出现一圈灰色矩形。
+    if max_height is not None:
+        max_lines = max(1, (int(max_height) * ss - pad_y * 2) // line_h)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            last = lines[-1]
+            while last and font.getlength(last + "…") > (text_limit or w):
+                last = last[:-1]
+            lines[-1] = last + "…"
+            h = line_h * len(lines) + pad_y * 2
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img, "RGBA")
+    # 位图尺寸就是卡片尺寸；不擦除最外圈，保留连续细描边。
+    # Canvas 在 native region 内显示这张图，不需要颜色键或投影边距。
     bw = max(1, theme.lpx(theme.TOOLTIP_BORDER_W) * ss)
     draw.rounded_rectangle(
         [0, 0, w - 1, h - 1], radius=radius,
@@ -345,14 +352,76 @@ def tooltip_image(text: str, max_width: Optional[int] = None):
 
     lw, lh = max(1, math.ceil(w / ss)), max(1, math.ceil(h / ss))
     small = img.resize((lw, lh), Image.LANCZOS)
-    # 最外圈强制**全透明**：LANCZOS 缩放在边界会留下 alpha=1 的振铃残留，
-    # 精确色键匹配不到时会在圆角卡外复活成一圈浅色方边。
-    # 用 paste 而非 draw：draw 在 RGBA 上是 alpha 混合，盖不掉已有像素。
-    if lw > 2 and lh > 2:
-        inner = small.crop((1, 1, lw - 1, lh - 1))
-        small = Image.new("RGBA", (lw, lh), (0, 0, 0, 0))
-        small.paste(inner, (1, 1))
     return small, (lw, lh)
+
+
+def toast_image(message: str, max_width: int, celebration: bool = False,
+                action_label: str = ""):
+    """Toast 的完整客户区位图；返回图、物理尺寸和可选动作点击区。"""
+    from PIL import Image, ImageDraw
+    from .. import fonts
+
+    ss = theme.BITMAP_SS
+    font = fonts.pil_font("small", supersample=ss)
+    action_font = fonts.pil_font("tiny", supersample=ss)
+    if font is None or action_font is None:
+        raise RuntimeError("提示字体不可用")
+    px, py = theme.lpx(theme.TOAST_PAD_X), theme.lpx(theme.TOAST_PAD_Y)
+    gap = theme.lpx(theme.TOAST_GAP)
+    icon = theme.lpx(theme.TOAST_ICON) if celebration and not action_label else 0
+    action_w = max(theme.lpx(theme.TOAST_ACTION_W),
+                   math.ceil(action_font.getlength(action_label) / ss) + px) if action_label else 0
+    extra = (action_w + gap) if action_label else 2 * (icon + gap) if icon else 0
+    available = max(ss, (max_width - px * 2 - extra) * ss)
+    lines = []
+    for paragraph in str(message).split("\n"):
+        line = ""
+        for char in paragraph:
+            if line and font.getlength(line + char) > available:
+                lines.append(line)
+                line = char
+            else:
+                line += char
+        lines.append(line)
+    asc, desc = font.getmetrics()
+    line_h = asc + desc
+    if len(lines) > theme.TOAST_MAX_LINES:
+        lines = lines[:theme.TOAST_MAX_LINES]
+        while lines[-1] and font.getlength(lines[-1] + "…") > available:
+            lines[-1] = lines[-1][:-1]
+        lines[-1] += "…"
+    text_w = math.ceil(max((font.getlength(line) for line in lines), default=0) / ss)
+    width = min(max_width, max(1, px * 2 + text_w + extra))
+    action_h = theme.lpx(theme.TOAST_ACTION_H) if action_label else 0
+    height = py * 2 + max(math.ceil(line_h * len(lines) / ss), icon, action_h)
+    radius = min(theme.lpx(theme.TOAST_RADIUS), width // 2, height // 2)
+    border = max(1, theme.lpx(theme.TOAST_BORDER_W))
+    big = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(big)
+    draw.rounded_rectangle((0, 0, width * ss - 1, height * ss - 1),
+                           radius=radius * ss, fill=theme.c("toast_border"))
+    inset = border * ss
+    draw.rounded_rectangle((inset, inset, width * ss - 1 - inset, height * ss - 1 - inset),
+                           radius=max(0, (radius - border) * ss), fill=theme.c("toast_bg"))
+    text_left = px + (icon + gap if icon else 0)
+    text_right = width - px - (icon + gap if icon else action_w + gap if action_label else 0)
+    text_y = (height * ss - line_h * len(lines)) / 2 + asc
+    for index, line in enumerate(lines):
+        draw.text(((text_left + text_right) * ss / 2, text_y + index * line_h), line,
+                  font=font, fill=theme.c("toast_text"), anchor="ms")
+    if icon:
+        sparkle = icons.get_pil("toast_sparkle", icon * ss)
+        if sparkle is not None:
+            big.paste(sparkle, (px * ss, (height * ss - sparkle.height) // 2), sparkle)
+    action_box = None
+    if action_label:
+        left, top = width - px - action_w, (height - action_h) // 2
+        action_box = (left, top, left + action_w, top + action_h)
+        draw.rounded_rectangle(tuple(v * ss for v in action_box),
+                               radius=action_h * ss / 2, fill=theme.c("accent_soft"))
+        draw.text(((left + action_w / 2) * ss, height * ss / 2), action_label,
+                  font=action_font, fill=theme.c("text"), anchor="mm")
+    return big.resize((width, height), Image.LANCZOS), (width, height), action_box
 
 
 def aa_corner(radius: int, inside: str, outside: str, pad: int = 2):
@@ -637,8 +706,8 @@ class TextLabel(ctk.CTkLabel):
 # 圆环与对勾用 PIL 以 4× 超采样渲染成**带 alpha 的位图**再贴到 Canvas 上。
 # 为什么不用 ``create_oval``：Tk 的 Canvas 图元**不做抗锯齿**，1.4px 的细线
 # 会被量化成"一粒一粒"的硬块（这正是上一版"简陋"观感的来源之一）。
-_CHECK_PATH = ((-0.135, 0.012), (-0.041, 0.113), (0.150, -0.105))
-_CHECK_SS = 4                     # 超采样倍率
+_CHECK_PATH = theme.TASK_CHECK_PATH
+_CHECK_SS = theme.BITMAP_SS                     # 超采样倍率
 
 
 def _render_check_pil(size: int, ring_w: float, mark_w: float, ring_color: str,
@@ -692,10 +761,10 @@ class SunCheck(tk.Canvas):
     _PIL_CACHE: dict = {}
 
     def __init__(self, master: tk.Misc, size: int = 26, checked: bool = False,
-                 bg: str = "#FFFFFF", command: Optional[Callable[[bool], None]] = None,
+                 bg: str = theme.LIGHT["card"], command: Optional[Callable[[bool], None]] = None,
                  animate: bool = True) -> None:
         super().__init__(master, width=size, height=size, bg=bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2", takefocus=1)
         self._size = size
         self._checked = checked
         self._bg = bg
@@ -706,6 +775,10 @@ class SunCheck(tk.Canvas):
         self._animating = False
         self._photo = None            # 必须持引用，否则 PhotoImage 被 GC
         self.bind("<Button-1>", self._on_click)
+        self.bind("<space>", self._on_key)
+        self.bind("<Return>", self._on_key)
+        self.bind("<FocusIn>", lambda _e: self._draw(), add="+")
+        self.bind("<FocusOut>", lambda _e: self._draw(), add="+")
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self._draw()
@@ -734,6 +807,11 @@ class SunCheck(tk.Canvas):
         c = self._size / 2.0
         self._photo = ImageTk.PhotoImage(self._pil(self._checked, self._hover))
         self.create_image(c, c, image=self._photo, anchor="center")
+        if self.focus_get() is self:
+            self.create_oval(
+                1, 1, self._size - 1, self._size - 1,
+                outline=theme.c("accent_soft"), width=max(1, theme.lpx(1)),
+            )
 
     def set_bg(self, bg: str) -> None:
         """同步画布底色 = 卡片**当前**底色（换主题 / 切完成态 / 拖拽高亮时调用）。"""
@@ -757,7 +835,16 @@ class SunCheck(tk.Canvas):
             self._draw()
 
     def _on_click(self, _event=None) -> None:
+        try:
+            self.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
         self.set(not self._checked, notify=True)
+
+    def _on_key(self, event=None) -> str:
+        if event is not None and getattr(event, "keysym", "") in ("space", "Return"):
+            self.set(not self._checked, notify=True)
+        return "break"
 
     def set(self, value: bool, notify: bool = False) -> None:
         changed = value != self._checked
@@ -968,7 +1055,7 @@ class SoftProgress(AutoRedrawCanvas):
     """
 
     def __init__(self, master: tk.Misc, width: int = 300, height: int = 10,
-                 bg: str = "#FFFFFF", value: float = 0.0) -> None:
+                 bg: str = theme.LIGHT["card"], value: float = 0.0) -> None:
         self._cw = theme.lpx(width)
         self._ch = theme.lpx(height)
         super().__init__(master, width=self._cw, height=self._ch, bg=bg,
@@ -1025,7 +1112,7 @@ class SoftBarChart(AutoRedrawCanvas):
     """
 
     def __init__(self, master: tk.Misc, width: int = 340, height: int = 130,
-                 bg: str = "#FFFFFF") -> None:
+                 bg: str = theme.LIGHT["card"]) -> None:
         self._cw = theme.lpx(width)
         self._ch = theme.lpx(height)
         super().__init__(master, width=self._cw, height=self._ch, bg=bg,
@@ -1201,7 +1288,7 @@ class EmptyIllustration(AutoRedrawCanvas):
     W, H = theme.EMPTY_ILLUS_W, theme.EMPTY_ILLUS_H
 
     def __init__(self, master: tk.Misc, width: int = 0, height: int = 0,
-                 bg: str = "#FFFFFF") -> None:
+                 bg: str = theme.LIGHT["card"]) -> None:
         self._cw = theme.lpx(width or self.W)
         self._ch = theme.lpx(height or self.H)
         super().__init__(master, width=self._cw, height=self._ch, bg=bg,
@@ -1329,8 +1416,17 @@ class TopNavSwitcher(tk.Canvas):
         self._h = theme.lpx(theme.SWITCH_H)
         super().__init__(master, width=total, height=self._h,
                          bg=self._bg, highlightthickness=0, bd=0,
+                         takefocus=1,
                          cursor="hand2")
         self.bind("<Button-1>", self._on_click)
+        self.bind("<Left>", self._on_key)
+        self.bind("<Right>", self._on_key)
+        self.bind("<Home>", self._on_key)
+        self.bind("<End>", self._on_key)
+        self.bind("<Return>", self._on_key)
+        self.bind("<space>", self._on_key)
+        self.bind("<FocusIn>", lambda _e: self._draw(), add="+")
+        self.bind("<FocusOut>", lambda _e: self._draw(), add="+")
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", lambda _e: self._set_hover(""))
         self._draw()
@@ -1348,7 +1444,7 @@ class TopNavSwitcher(tk.Canvas):
         """窄窗紧凑模式（1.5.18）：隐藏非关键项，只留关键导航不重叠。
 
         窗口缩到放不下完整导航时，"光景"先让路（统计页等加宽窗口再进），
-        保证"新建 / 今日 / 设置"始终完整可点。状态没变就不重建（防抖要求：
+        保证"新建 / 任务 / 设置"始终完整可点。状态没变就不重建（防抖要求：
         截断/重排必须有尺寸未变跳过）。紧凑期间若当前页恰好是被隐藏的项，
         高亮暂时消失但页面本身不动，加宽窗口后自动恢复。
         """
@@ -1408,7 +1504,7 @@ class TopNavSwitcher(tk.Canvas):
         try:
             from .. import icons
             if active:
-                photo = icons.get_tinted(icon_key, size, "#FFFFFF")
+                photo = icons.get_tinted(icon_key, size, theme.c("on_nav"))
             else:
                 photo = icons.get(icon_key, size)
         except Exception:  # noqa: BLE001
@@ -1500,7 +1596,7 @@ class TopNavSwitcher(tk.Canvas):
         icon_px = theme.lpx(theme.SWITCH_ICON)
         gap_px = theme.lpx(theme.NAV_ICON_GAP)
         name = self._icon_name(icon_key, active)
-        icon_img = (icons.get_pil_tinted(name, icon_px * ss, "#FFFFFF")
+        icon_img = (icons.get_pil_tinted(name, icon_px * ss, theme.c("on_nav"))
                     if active else icons.get_pil(name, icon_px * ss))
         if icon_img is None:
             icon_img = icons.get_pil(icon_key, icon_px * ss)
@@ -1510,7 +1606,7 @@ class TopNavSwitcher(tk.Canvas):
                       icon_img)
         font = fonts.pil_font(theme.SWITCH_FONT, supersample=ss)
         if font is not None and label:
-            color = "#FFFFFF" if active else theme.c("text_muted")
+            color = theme.c("on_nav") if active else theme.c("text_muted")
             draw.text((int((pad + icon_px + gap_px) * ss), h * ss / 2), label,
                       font=font, fill=color, anchor="lm")
         return img.resize((w, h), Image.LANCZOS)
@@ -1533,7 +1629,7 @@ class TopNavSwitcher(tk.Canvas):
                        fill=theme.mix(self._bg, theme.c("accent"),
                                       theme.NAV_HOVER_MIX),
                        outline="")
-        color = "#FFFFFF" if active else theme.c("text_muted")
+        color = theme.c("on_nav") if active else theme.c("text_muted")
         photo = self._icon(self._icon_name(icon_key, active), active)
         if photo is not None:
             self.create_image(x + pad + icon_px / 2, h / 2, image=photo)
@@ -1552,12 +1648,40 @@ class TopNavSwitcher(tk.Canvas):
         return -1
 
     def _on_click(self, event) -> None:
+        try:
+            self.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
         idx = self._hit(event.x)
         if idx < 0:
             return
         key = self._items[idx][0]
         self.set_current(key)
         self._command(key)
+
+    def _on_key(self, event) -> str:
+        if not self._items:
+            return "break"
+        keys = [item[0] for item in self._items]
+        try:
+            index = keys.index(self._current)
+        except ValueError:
+            index = 0
+        if event.keysym in ("Left", "Right", "Home", "End"):
+            if event.keysym == "Left":
+                index = (index - 1) % len(keys)
+            elif event.keysym == "Right":
+                index = (index + 1) % len(keys)
+            elif event.keysym == "Home":
+                index = 0
+            else:
+                index = len(keys) - 1
+            key = keys[index]
+            self.set_current(key, animate=False)
+            self._command(key)
+        elif event.keysym in ("Return", "space") and self._current:
+            self._command(self._current)
+        return "break"
 
     def _set_hover(self, key: str) -> None:
         if key == self._hover:
@@ -1627,8 +1751,8 @@ def fade_out(widget: tk.Misc, steps: int = 10, interval: int = 20,
         except Exception:  # noqa: BLE001
             continue
 
-    light_to = theme.LIGHT.get(target, "#FAF7F2")
-    dark_to = theme.DARK.get(target, "#2D2A26")
+    light_to = theme.LIGHT.get(target, theme.LIGHT["bg"])
+    dark_to = theme.DARK.get(target, theme.DARK["bg"])
 
     def step(i: int) -> None:
         if not widget.winfo_exists():
@@ -1701,209 +1825,136 @@ def pulse(widget: tk.Misc, steps: int = 6, interval: int = 25,
 # --------------------------------------------------------------------------
 # 浮层提示（Toast）
 # --------------------------------------------------------------------------
-class Toast(ctk.CTkToplevel):
-    """主窗口内的暖色圆角提示，按内容自适应并自动收起。
-
-    普通 CTkFrame 的圆角是画出来的，控件本身仍占矩形区域；它盖住多张不同
-    底色的任务卡时，圆角外就会露出矩形底色。这里用精确贴合内容的无边框
-    Toplevel，并在 Windows 给窗口设置原生圆角区域，从窗口形状上裁掉矩形角。
-    """
+class Toast(tk.Toplevel):
+    """精确贴合内容的 Canvas 提示卡，无投影留边和 DPI 几何补偿。"""
 
     def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master, fg_color=theme.pair("bg"))
-        self.overrideredirect(True)
-        try:
-            self.transient(master.winfo_toplevel())
-        except Exception:  # noqa: BLE001
-            pass
+        super().__init__(master)
         self.withdraw()
-
-        self._surface = ctk.CTkFrame(
-            self, corner_radius=14,
-            bg_color=theme.pair("bg"),
-            fg_color=theme.pair("tooltip_bg"),
-            border_width=1, border_color=theme.pair("orange"),
-        )
-        self._surface.pack(fill="both", expand=True)
-        self._icon = ctk.CTkLabel(
-            self._surface, text="", image=icons.get_ctk("toast_sparkle", 18),
-            width=18, height=18,
-        )
-        self._label = ctk.CTkLabel(
-            self._surface, text="", font=theme.font("small"),
-            text_color=theme.pair("text"), wraplength=320,
-            justify="center", anchor="center",
-        )
-        self._label.pack(side="left", fill="x", expand=True,
-                         padx=14, pady=9)
-        # 庆祝图标单独放左侧时，用等宽空位平衡右侧，保证正文中心仍在气泡中心。
-        self._spacer = ctk.CTkLabel(self._surface, text="", width=18)
+        self.overrideredirect(True)
+        self.transient(master.winfo_toplevel())
+        self.configure(bg=theme.c("toast_border"))
+        self.canvas = tk.Canvas(self, bd=0, highlightthickness=0,
+                                bg=theme.c("toast_border"))
+        self.canvas.pack(fill="both", expand=True)
+        self._photo = None
+        self._image = None
+        self._action_box = None
+        self._action_command: Optional[Callable[[], None]] = None
         self._job: Optional[str] = None
         self._region_job: Optional[str] = None
+        self._watch_job: Optional[str] = None
+        self.canvas.bind("<ButtonRelease-1>", self._click)
+        self.canvas.bind("<Motion>", self._motion)
+        self.bind("<Escape>", lambda _e: self.hide())
 
-    def show(self, message: str, duration: int = 2600,
-             anchor: Optional[tk.Misc] = None,
-             celebration: bool = False) -> None:
-        if self._job:
-            try:
-                self.after_cancel(self._job)
-            except Exception:  # noqa: BLE001
-                pass
-        if self._region_job:
-            try:
-                self.after_cancel(self._region_job)
-            except Exception:  # noqa: BLE001
-                pass
-            self._region_job = None
+    def show(self, message: str, duration: int = theme.TOAST_DURATION_MS,
+             anchor: Optional[tk.Misc] = None, celebration: bool = False,
+             action_label: str = "",
+             action_command: Optional[Callable[[], None]] = None) -> None:
+        from PIL import ImageTk
+        from .window_shape import attach_native_owner
 
-        # CTkFrame 的圆角并非操作系统级透明：圆角外仍是独立的矩形画布，
-        # 其颜色来自 bg_color。Toast 贴在完成任务卡上时，若继续透出主窗口
-        # 的米白色，就会在绿卡周围留下一个矩形色块。取最近任务卡当前的
-        # fg_color（含悬停态）作为画布底色，使圆角外沿与被覆盖卡片融为一体。
-        # 普通提示没有卡片锚点，继续使用页面底色。
-        underlay: Any = theme.pair("bg")
-        node = anchor
-        while node is not None:
-            if (isinstance(node, ctk.CTkFrame)
-                    and hasattr(node, "task") and hasattr(node, "check")):
-                try:
-                    underlay = node.cget("fg_color")
-                except Exception:  # noqa: BLE001
-                    pass
-                break
-            node = getattr(node, "master", None)
-        self.configure(fg_color=underlay)
-        self._surface.configure(bg_color=underlay)
-
-        if celebration:
-            if not self._icon.winfo_manager():
-                self._icon.pack(side="left", before=self._label,
-                                padx=(14, 7), pady=9)
-            self._label.pack_configure(padx=0, pady=9, fill="x", expand=True)
-            if not self._spacer.winfo_manager():
-                self._spacer.pack(side="right", padx=(7, 14), pady=9)
-        else:
-            self._icon.pack_forget()
-            self._spacer.pack_forget()
-            self._label.pack_configure(padx=14, pady=9, fill="x", expand=True)
-
+        self.hide()
         host = self.master
+        if (not host.winfo_exists() or not host.winfo_viewable()
+                or not getattr(host, "is_foreground", lambda: True)()):
+            return
         host.update_idletasks()
-        scale = theme.scale() or 1.0
-        host_w = max(1, host.winfo_width())
-        host_h = max(1, host.winfo_height())
-        edge = theme.lpx(10)
-        reserved = 58 if celebration else 36
-        wrap_logic = max(
-            80,
-            min(320, int((host_w - edge * 2) / scale) - reserved),
-        )
-        self._label.configure(wraplength=wrap_logic)
-        self._label.configure(text=message)
-        self._surface.update_idletasks()
-        toast_w = min(max(1, self._surface.winfo_reqwidth()),
-                      max(1, host_w - edge * 2))
-        toast_h = max(1, self._surface.winfo_reqheight())
-
+        host_w, host_h = max(1, host.winfo_width()), max(1, host.winfo_height())
+        if host_w <= 1 or host_h <= 1:
+            return
+        edge = theme.lpx(theme.TOAST_EDGE_PAD)
+        width_limit = min(theme.lpx(theme.TOAST_MAX_W), max(1, host_w - edge * 2))
+        action_label = action_label if action_command else ""
+        image, (width, height), action_box = toast_image(
+            message, width_limit, celebration, action_label)
+        self._image, self._action_box = image, action_box
+        self._action_command = action_command if action_label else None
+        self.configure(bg=theme.c("toast_border"))
+        self.canvas.configure(width=width, height=height, bg=theme.c("toast_border"))
+        self._photo = ImageTk.PhotoImage(image, master=self)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        x = (host_w - width) // 2
+        y = host_h - theme.lpx(theme.TOAST_BOTTOM_OFFSET) - height
         if anchor is not None:
             try:
                 if anchor.winfo_exists():
                     ax = anchor.winfo_rootx() - host.winfo_rootx()
                     ay = anchor.winfo_rooty() - host.winfo_rooty()
-                    aw, ah = anchor.winfo_width(), anchor.winfo_height()
-                    x = ax + aw + edge
-                    if x + toast_w > host_w - edge:
-                        x = ax - toast_w - edge
-                    if x < edge:
-                        x = min(max(edge, ax + (aw - toast_w) // 2),
-                                host_w - edge - toast_w)
-                    y = ay + (ah - toast_h) // 2
-                    if y + toast_h > host_h - edge:
-                        y = ay - toast_h - edge
-                    y = min(max(edge, y), host_h - edge - toast_h)
-                else:
-                    anchor = None
-            except Exception:  # noqa: BLE001
-                anchor = None
-
-        if anchor is None:
-            # 通用提示仍在底部居中，但上移一段距离，少挡住末尾几条任务。
-            x = (host_w - toast_w) // 2
-            y = host_h - theme.lpx(116) - toast_h
-            y = max(edge, min(y, host_h - edge - toast_h))
-
-        # CTk 子控件的请求尺寸是当前 DPI 下的像素，而 wm geometry 的宽高
-        # 仍按逻辑单位解释。若直接传 toast_w/toast_h，Windows 会再放大一次，
-        # 窗口比内容大一圈，后续原生圆角区域便只裁到左上角。几何尺寸先除 DPI，
-        # 坐标则继续使用 winfo_rootx/y 的屏幕像素。
-        screen_x = host.winfo_rootx() + x
-        screen_y = host.winfo_rooty() + y
-        geometry_w = max(1, int(round(toast_w / scale)))
-        geometry_h = max(1, int(round(toast_h / scale)))
-        self.geometry(f"{geometry_w}x{geometry_h}{screen_x:+d}{screen_y:+d}")
-        # Withdrawn 的 Toplevel 在 deiconify 前仍可能回报旧的 1×1/上次尺寸；
-        # 先映射并让 Tk 完成 DPI 缩放，再以最终客户区尺寸设置 Windows 区域。
-        # 否则区域只盖到左上角，右边与底边就会被系统裁掉。
+                    x = ax + anchor.winfo_width() + edge
+                    if x + width > host_w - edge:
+                        x = (host_w - width) // 2
+                    # 优先在完成卡上方反馈，不盖住刚勾选的任务和下方卡片。
+                    y = ay - height - edge
+                    if y < edge:
+                        y = ay + anchor.winfo_height() + edge
+            except tk.TclError:
+                pass
+        x = max(edge, min(x, host_w - edge - width))
+        y = max(edge, min(y, host_h - edge - height))
+        self.geometry(f"{width}x{height}{host.winfo_rootx() + x:+d}{host.winfo_rooty() + y:+d}")
+        # 在映射之前裁好窗口形状，首帧也不会闪出矩形角。
+        apply_rounded_region(self, theme.lpx(theme.TOAST_RADIUS), size=(width, height))
         self.deiconify()
+        self.update_idletasks()
+        attach_native_owner(self, host)
+        self.attributes("-topmost", bool(getattr(host, "store", None) and
+                        host.store.settings.get("always_on_top", False)))
         self.lift()
-        self._region_job = self.after_idle(self._apply_native_round_region_to_window)
+        self._apply_native_round_region_to_window()
+        self._region_job = self.after(theme.POPUP_SHAPE_DELAY_MS,
+                                      self._apply_native_round_region_to_window)
         self._job = self.after(duration, self.hide)
+        self._watch_job = self.after(theme.FLOAT_WATCH_MS, self._watch_owner)
+
+    def _watch_owner(self) -> None:
+        self._watch_job = None
+        try:
+            foreground = getattr(self.master, "is_foreground", lambda: True)()
+            if not self.master.winfo_viewable() or not foreground:
+                self.hide()
+                return
+            self._watch_job = self.after(theme.FLOAT_WATCH_MS, self._watch_owner)
+        except tk.TclError:
+            self.hide()
+
+    def _inside_action(self, event) -> bool:
+        if self._action_box is None:
+            return False
+        x1, y1, x2, y2 = self._action_box
+        return x1 <= event.x <= x2 and y1 <= event.y <= y2
+
+    def _motion(self, event) -> None:
+        self.canvas.configure(cursor="hand2" if self._inside_action(event) else "")
+
+    def _click(self, event) -> None:
+        if self._inside_action(event):
+            self._run_action()
+
+    def _run_action(self) -> None:
+        callback = self._action_command
+        self.hide()
+        if callback is not None:
+            callback()
 
     def _apply_native_round_region_to_window(self) -> None:
         self._region_job = None
-        if not self.winfo_exists() or not self.winfo_viewable():
-            return
-        self._apply_native_round_region(
-            max(1, self.winfo_width()), max(1, self.winfo_height()))
-
-    def _apply_native_round_region(self, width: int, height: int) -> None:
-        """裁掉 Windows 无边框窗口的矩形角，不用颜色键或投影留白。"""
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
-            hwnd_arg = wintypes.HWND
-            hrgn_arg = wintypes.HRGN
-            user32.GetAncestor.argtypes = [hwnd_arg, wintypes.UINT]
-            user32.GetAncestor.restype = hwnd_arg
-            user32.SetWindowRgn.argtypes = [hwnd_arg, hrgn_arg, wintypes.BOOL]
-            user32.SetWindowRgn.restype = ctypes.c_int
-            gdi32.CreateRoundRectRgn.argtypes = [
-                ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ]
-            gdi32.CreateRoundRectRgn.restype = hrgn_arg
-            gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
-            gdi32.DeleteObject.restype = wintypes.BOOL
-
-            # winfo_id 可能指向 Tk 的内部客户区句柄，GA_ROOT 取到真实顶层窗口。
-            hwnd = user32.GetAncestor(hwnd_arg(self.winfo_id()), 2)
-            if not hwnd:
-                hwnd = hwnd_arg(self.winfo_id())
-            radius = max(1, int(round(
-                getattr(self._surface, "_corner_radius", theme.lpx(14)))))
-            diameter = radius * 2
-            region = gdi32.CreateRoundRectRgn(
-                0, 0, max(1, width + 1), max(1, height + 1), diameter, diameter)
-            if region and not user32.SetWindowRgn(hwnd, region, True):
-                gdi32.DeleteObject(region)
-        except Exception:  # noqa: BLE001
-            # 非常规 Windows 环境若不支持窗口区域，仍保留暖色底和圆角绘制。
-            pass
+        if self.winfo_exists() and self.winfo_viewable():
+            apply_rounded_region(self, theme.lpx(theme.TOAST_RADIUS))
 
     def hide(self) -> None:
-        if self._region_job:
-            try:
-                self.after_cancel(self._region_job)
-            except Exception:  # noqa: BLE001
-                pass
-            self._region_job = None
+        for attr in ("_job", "_region_job", "_watch_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+            setattr(self, attr, None)
         self.withdraw()
-        self._job = None
+        self._action_command = None
 
 
 # --------------------------------------------------------------------------

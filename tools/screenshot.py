@@ -135,6 +135,117 @@ def _collect_toplevels(widget, out, depth: int = 0) -> None:
             continue
 
 
+def _above_in_window_stack(front, back):
+    """Windows Z 序实测：前窗是否排在后窗上方；无法测量返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetTopWindow.argtypes = [wintypes.HWND]
+        user32.GetTopWindow.restype = wintypes.HWND
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindow.restype = wintypes.HWND
+        front_hwnd = user32.GetAncestor(front.winfo_id(), 2)
+        back_hwnd = user32.GetAncestor(back.winfo_id(), 2)
+        current = user32.GetTopWindow(None)
+        for _ in range(4096):
+            if not current:
+                break
+            if current == front_hwnd:
+                return True
+            if current == back_hwnd:
+                return False
+            current = user32.GetWindow(current, 2)  # GW_HWNDNEXT
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _native_round_region_ok(window, native_root=True):
+    """Windows 上确认整个弹窗被裁成圆角，不能只检查 CTk 绘制内容。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN]
+        user32.GetWindowRgn.restype = ctypes.c_int
+        gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+        gdi32.CreateRectRgn.restype = wintypes.HRGN
+        gdi32.PtInRegion.argtypes = [wintypes.HRGN, ctypes.c_int, ctypes.c_int]
+        gdi32.PtInRegion.restype = wintypes.BOOL
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+
+        hwnd = wintypes.HWND(window.winfo_id())
+        if native_root:
+            hwnd = user32.GetAncestor(hwnd, 2) or hwnd
+        region = gdi32.CreateRectRgn(0, 0, 1, 1)
+        if not hwnd or not region:
+            return False
+        try:
+            if user32.GetWindowRgn(hwnd, region) != 3:  # COMPLEXREGION
+                return False
+            width, height = window.winfo_width(), window.winfo_height()
+            corners = ((0, 0), (width - 1, 0),
+                       (0, height - 1), (width - 1, height - 1))
+            return (all(not gdi32.PtInRegion(region, x, y) for x, y in corners)
+                    and bool(gdi32.PtInRegion(region, width // 2, height // 2)))
+        finally:
+            gdi32.DeleteObject(region)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _uniform_window_border(image, bbox, window, color, radius):
+    """量四边宽度与四个角的描边连续性。"""
+    from PIL import ImageColor
+
+    rgb = ImageColor.getrgb(color)
+    pixels = image.convert("RGB")
+    x = window.winfo_rootx() - bbox[0]
+    y = window.winfo_rooty() - bbox[1]
+    width, height = window.winfo_width(), window.winfo_height()
+    cx, cy = x + width // 2, y + height // 2
+    points = ((cx, y, 0, 1), (cx, y + height - 1, 0, -1),
+              (x, cy, 1, 0), (x + width - 1, cy, -1, 0))
+    runs = []
+    for px, py, dx, dy in points:
+        run = 0
+        for offset in range(12):
+            sample = (px + dx * offset, py + dy * offset)
+            if not (0 <= sample[0] < image.width and 0 <= sample[1] < image.height):
+                break
+            if pixels.getpixel(sample) != rgb:
+                break
+            run += 1
+        runs.append(run)
+    def border_tone(pixel):
+        return all(abs(pixel[channel] - rgb[channel]) <= 24 for channel in range(3))
+
+    corners = []
+    for right in (False, True):
+        xs = (range(x + width - radius - 3, x + width) if right
+              else range(x, x + radius + 3))
+        for bottom in (False, True):
+            ys = (range(y + height - radius, y + height) if bottom
+                  else range(y, y + radius))
+            corners.append(all(any(border_tone(pixels.getpixel((px, py))) for px in xs)
+                               for py in ys))
+    return (max(runs) - min(runs) <= 1 and min(runs) >= 1
+            and all(corners)), runs, corners
+
+
 def _raise_floating(app) -> None:
     """把已显示的浮层也置顶，避免被置顶的主窗口盖住。
 
@@ -356,6 +467,8 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         _seed_demo_data()
 
     app = ShiguangApp()
+    if extra.startswith(("hint", "toast")):
+        app.is_foreground = lambda: True  # freeze only the preview watchdog
     # 截图工具会主动销毁窗口，此时挂起的 after 动画回调会以
     # "invalid command name ...step / application has been destroyed" 的形式
     # 冒到 stderr。这是工具侧的正常现象，不该污染输出 —— 直接吞掉。
@@ -376,7 +489,17 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
     if page != "tasks":
         app.show_page(page)
     try:
-        app.attributes("-topmost", True)
+        # Modal-window regression scenes must use the app's configured stacking
+        # mode. Forcing only the root above every other window can hide an owned
+        # modal while its grab remains active, manufacturing the exact deadlock
+        # these scenes are meant to detect.
+        modal_scene = extra in ("taskdialog-due", "quickadd-due", "taskdialog",
+                                "menu-due-action", "menu-due-clear-action",
+                                "menu-move-view", "menu-move-action",
+                                "menu-edit-action", "menu-delete-action",
+                                "group-rename-action", "group-icon-action")
+        app.attributes("-topmost", bool(app.store.settings.get("always_on_top", False))
+                       if modal_scene else True)
     except Exception:  # noqa: BLE001
         pass
     app.update()
@@ -395,6 +518,9 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         # 滚动到指定位置（设置页的"通知"卡片在折叠线以下，不滚看不到）
         try:
             holder = getattr(app.page, "body", None)
+            if holder is None:
+                holder = next((child for child in app.page.winfo_children()
+                               if hasattr(child, "_parent_canvas")), None)
             if holder is not None:
                 holder._parent_canvas.yview_moveto(scroll)
                 pump(0.5)
@@ -406,6 +532,7 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         app.particles.play(26)
         pump(0.45)
 
+    regression_ok = True
     if extra == "banner":
         # 逾期提醒条：用**真实点击序列**展开（Enter → Button-1 → ButtonRelease-1），
         # 不直接调 ``_toggle_detail()``。
@@ -425,6 +552,22 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
                 print(f"  逾期条展开={getattr(banner, '_expanded', None)}（真实点击）")
         except Exception as exc:  # noqa: BLE001
             print(f"  提醒条展开失败：{exc}")
+
+    elif extra == "nav-focus":
+        # 复现点击/Tab 聚焦导航后，Tk Canvas 自带的一圈橙色矩形高亮。
+        app.nav.focus_force()
+        pump(0.25)
+        print(f"  导航焦点={app.focus_get() == app.nav} "
+              f"高亮宽度={app.nav.cget('highlightthickness')}")
+        regression_ok = (app.focus_get() == app.nav
+                         and int(app.nav.cget("highlightthickness")) == 0)
+        app.nav.event_generate("<Right>")
+        pump(0.12)
+        keyboard_ok = app.nav.current() == "stats"
+        app.nav.event_generate("<Left>")
+        pump(0.12)
+        regression_ok = regression_ok and keyboard_ok and app.nav.current() == "tasks"
+        print(f"  左右方向键切换={keyboard_ok and app.nav.current() == 'tasks'}")
 
     elif extra == "quickadd":
         # 新建任务浮层：从顶部"＋ 新建任务"按钮弹出，等淡入动画走完
@@ -455,6 +598,233 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         except Exception as exc:  # noqa: BLE001
             print(f"  新建浮层弹出失败：{exc}")
 
+    elif extra in ("filter", "filter-narrow"):
+        # 任务筛选器：验证圆角面板在主窗口客户区内展开，不生成系统菜单窗口。
+        try:
+            if extra == "filter-narrow":
+                app.geometry("320x400")
+                pump(0.6)
+            dropdown = app.page.filter_menu
+            dropdown.open()
+            pump(0.35)
+            pop = dropdown._popup
+            if pop is not None:
+                ax, ay = app.winfo_rootx(), app.winfo_rooty()
+                bx, by = ax + app.winfo_width(), ay + app.winfo_height()
+                px, py = pop.winfo_rootx(), pop.winfo_rooty()
+                pw, ph = pop.winfo_width(), pop.winfo_height()
+                inside = px >= ax and py >= ay and px + pw <= bx and py + ph <= by
+                rounded = _native_round_region_ok(pop, native_root=False)
+                regression_ok = regression_ok and inside and rounded
+                print(f"  筛选面板 {pw}x{ph}@{px},{py} 主窗口 {app.winfo_width()}x"
+                      f"{app.winfo_height()}@{ax},{ay} 落在窗口内={inside} "
+                      f"子窗口圆角裁剪={rounded}")
+                if not inside:
+                    print("  WARN 任务筛选面板超出主窗口边界")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  筛选面板弹出失败：{exc}")
+
+    elif extra == "groupdropdown":
+        # 任务编辑里的分组选择器与主页面共用同一套应用内下拉样式。
+        try:
+            from shiguang.ui.dialogs import TaskDialog
+
+            dialog = TaskDialog(app)
+            app._shot_group_dialog = dialog
+            pump(0.6)
+            dialog.group_menu.open()
+            pump(0.35)
+            pop = dialog.group_menu._popup
+            if pop is not None:
+                ax, ay = dialog.winfo_rootx(), dialog.winfo_rooty()
+                bx, by = ax + dialog.winfo_width(), ay + dialog.winfo_height()
+                px, py = pop.winfo_rootx(), pop.winfo_rooty()
+                pw, ph = pop.winfo_width(), pop.winfo_height()
+                inside = px >= ax and py >= ay and px + pw <= bx and py + ph <= by
+                rounded = _native_round_region_ok(pop, native_root=False)
+                regression_ok = regression_ok and inside and rounded
+                print(f"  分组选择面板落在编辑窗口内={inside} "
+                      f"子窗口圆角裁剪={rounded}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  分组选择面板弹出失败：{exc}")
+
+    elif extra == "prompt":
+        # 自绘标题栏的单行输入弹窗：核对重命名分组不再使用 Windows 默认边框。
+        try:
+            from shiguang.ui.dialogs import PromptDialog
+
+            app._shot_prompt = PromptDialog(
+                app, "重命名分组", "分组名称", "工作", lambda _value: None)
+            pump(0.6)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  单行输入弹窗失败：{exc}")
+
+    elif extra == "taskdialog":
+        # 完整任务编辑窗：检查新增/编辑表单迁入统一标题栏后的布局。
+        try:
+            from shiguang.ui.dialogs import TaskDialog
+
+            app._shot_task_dialog = TaskDialog(app)
+            pump(0.6)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  任务编辑弹窗失败：{exc}")
+
+    elif extra == "taskdialog-due":
+        # 回归嵌套模态：任务编辑 -> 截止日期。先取消、再确认一次，检查每次关闭
+        # 都把窗口层级与 grab 交还给任务编辑，再重新打开供截图核对前景显示。
+        try:
+            from shiguang.ui.dialogs import TaskDialog
+            from shiguang.ui.due_picker import DuePickerDialog
+
+            owner = TaskDialog(app)
+            app._shot_task_dialog = owner
+            pump(0.25)
+
+            def open_due():
+                owner.due_btn.invoke()
+                pump(0.3)
+                found = next((w for w in owner.winfo_children()
+                              if isinstance(w, DuePickerDialog)), None)
+                if found is None:
+                    print("  DEBUG task children=" + repr([
+                        (w, w.winfo_class(), w.winfo_viewable())
+                        for w in owner.winfo_children()]))
+                return found
+
+            def grab_owner():
+                grab = app.grab_current()
+                return grab.winfo_toplevel() if grab is not None else None
+
+            def owns_grab(window):
+                grab_top = grab_owner()
+                return (grab_top is not None and window is not None
+                        and str(grab_top._w) == str(window._w))
+
+            picker = open_due()
+            opened_ok = bool(
+                picker and picker.winfo_viewable()
+                and str(picker.transient()) == str(owner._w)
+                and owns_grab(picker))
+            print(f"  任务编辑内日期页可见/在前景并取得 grab={opened_ok}")
+            if picker:
+                picker._cancel()
+            pump(0.25)
+            cancel_ok = bool(
+                owner.winfo_viewable() and owns_grab(owner))
+            print(f"  取消后任务编辑仍在前景且恢复 grab={cancel_ok}")
+
+            picker = open_due()
+            if picker:
+                picker._confirm()
+            pump(0.25)
+            save_ok = bool(
+                owner.winfo_viewable() and owns_grab(owner)
+                and owner._due is not None)
+            print(f"  确认后任务编辑恢复且截止日期已写入={save_ok}")
+            picker = open_due()
+            if not (opened_ok and cancel_ok and save_ok and picker
+                    and picker.winfo_viewable() and owns_grab(picker)):
+                print("  WARN 嵌套日期选择器回归未通过")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  任务编辑截止日期回归失败：{exc}")
+
+    elif extra == "quickadd-due":
+        # 回归快速新建的日期页：取消/确认后浮层都应恢复前景，且确认值留在输入行。
+        try:
+            from shiguang.ui.due_picker import DuePickerDialog
+
+            app.open_quick_add()
+            pump(0.3)
+            owner = getattr(app, "_quick_popup", None)
+
+            def open_due():
+                if owner is None or owner._closed:
+                    return None
+                owner.cal_btn.invoke()
+                pump(0.3)
+                return next((w for w in app.winfo_children()
+                             if isinstance(w, DuePickerDialog)), None)
+
+            def grab_owner():
+                grab = app.grab_current()
+                return grab.winfo_toplevel() if grab is not None else None
+
+            def owns_grab(window):
+                grab_top = grab_owner()
+                return (grab_top is not None and window is not None
+                        and str(grab_top._w) == str(window._w))
+
+            picker = open_due()
+            opened_ok = bool(picker and picker.winfo_viewable()
+                             and owns_grab(picker))
+            print(f"  快速新建日期页可见/在前景并取得 grab={opened_ok}")
+            if picker:
+                picker._cancel()
+            pump(0.25)
+            cancel_ok = bool(owner and not owner._closed and owner.winfo_viewable())
+            print(f"  取消后快速新建浮层恢复前景={cancel_ok}")
+
+            picker = open_due()
+            if picker:
+                picker._confirm()
+            pump(0.25)
+            save_ok = bool(
+                owner and not owner._closed and owner.winfo_viewable()
+                and owner._due is not None)
+            print(f"  确认后快速新建恢复且截止日期已写入={save_ok}")
+            picker = open_due()
+            if not (opened_ok and cancel_ok and save_ok and picker
+                    and picker.winfo_viewable() and owns_grab(picker)):
+                print("  WARN 快速新建日期选择器回归未通过")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  快速新建截止日期回归失败：{exc}")
+
+    elif extra == "about":
+        # 关于窗口也继承 _BaseDialog，纳入同一套外观回归。
+        try:
+            from shiguang.ui.dialogs import AboutDialog
+
+            app._shot_about = AboutDialog(app)
+            pump(0.6)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  关于弹窗失败：{exc}")
+
+    elif extra == "search":
+        # 搜索的放大镜/有字清除叉，以及叉只清查询、不改状态筛选的语义回归。
+        try:
+            from shiguang import strings
+
+            page = app.page
+            page.filter_key = "overdue"
+            page.filter_menu.set(strings.TASK_FILTER_OPTIONS[2])
+            page.search_entry.insert("end", "报销")
+            page._sync_search_clear()
+            page._render_search_now()
+            pump(0.35)
+            page.search_clear.invoke()
+            preserves_filter = (
+                page.filter_key == "overdue"
+                and page.filter_menu.get() == strings.TASK_FILTER_OPTIONS[2])
+            print(f"  搜索叉保留逾期筛选={preserves_filter}")
+            page.search_entry.insert("end", "报销")
+            page._sync_search_clear()
+            page._render_search_now()
+            pump(0.35)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  搜索场景构造失败：{exc}")
+
+    elif extra == "search-empty":
+        try:
+            page = app.page
+            # 初始化时已经是空查询；不要 programmatically delete 一次，否则
+            # CustomTkinter 会把原生 placeholder 的绘制状态清掉，截图反而失真。
+            page._sync_search_clear()
+            pump(0.2)
+            print("  空搜索状态正常：",
+                  not page.search_entry.get() and not page.search_clear.winfo_manager())
+        except Exception as exc:  # noqa: BLE001
+            print(f"  空搜索场景构造失败：{exc}")
+
     elif extra == "menu":
         # 右键菜单截图：直接调任务卡片的菜单方法，比伪造鼠标事件稳。
         # 必须显式给坐标 —— 缺省走鼠标位置，脚本环境下光标可能停在
@@ -472,6 +842,132 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
                 _assert_floating_visible("任务右键菜单")
         except Exception as exc:  # noqa: BLE001
             print(f"  菜单弹出失败：{exc}")
+
+    elif extra in ("menu-due-action", "menu-due-clear-action",
+                   "menu-move-view", "menu-move-action",
+                   "menu-edit-action", "menu-delete-action",
+                   "group-rename-action", "group-icon-action"):
+        # 真实操作链：任务右键菜单 -> 子选项 -> 截止日期弹窗/移动分组。
+        # 只测直接构造 DuePickerDialog 会漏掉菜单的置顶残留与点击时序。
+        from shiguang.ui import menu as ui_menu
+        from shiguang.ui.due_picker import DuePickerDialog
+        from shiguang.ui.dialogs import ConfirmDialog, PromptDialog, TaskDialog
+        from shiguang.ui.icon_picker import IconPickerPopup
+
+        def click_named(menu_obj, label: str) -> bool:
+            y = 0
+            for item in menu_obj._rows:
+                height = menu_obj.SEP_H if item.is_separator else menu_obj.ROW_H
+                if item.label.startswith(label):
+                    menu_obj.canvas.event_generate(
+                        "<Button-1>", x=menu_obj.PAD + theme.lpx(20),
+                        y=y + height // 2)
+                    pump(0.18)
+                    return True
+                y += height
+            return False
+
+        try:
+            group_action = extra.startswith("group-")
+            card = next(iter(app.page.card_map.values()))
+            group_card = next(iter(app.page.group_cards.values()))
+            at = (app.winfo_rootx() + app.winfo_width() - theme.lpx(14),
+                  app.winfo_rooty() + app.winfo_height() - theme.lpx(180))
+            if group_action:
+                group_card._show_group_menu(at=at)
+            else:
+                card._show_menu(at=at)
+            pump(0.2)
+            parent = ui_menu._ACTIVE[-1]
+            _freeze_watchdog(parent)
+            labels = [item.label for item in parent._rows]
+            if not group_action:
+                if "10 分钟后再提醒" in labels:
+                    raise AssertionError("任务菜单仍显示已删除的延后提醒选项")
+                due_row = next((item for item in parent._rows
+                                if item.label == "设置截止日期"), None)
+                if due_row is None or due_row.is_submenu:
+                    raise AssertionError("截止日期应直接打开日期窗")
+            wanted = {
+                "menu-due-action": "设置截止日期",
+                "menu-due-clear-action": "设置截止日期",
+                "menu-move-view": "移动到分组",
+                "menu-move-action": "移动到分组",
+                "menu-edit-action": "编辑任务",
+                "menu-delete-action": "删除任务",
+                "group-rename-action": "重命名分组",
+                "group-icon-action": "更换图标",
+            }[extra]
+            if not click_named(parent, wanted):
+                raise AssertionError(f"任务菜单缺少 {wanted}")
+            if parent.winfo_exists():
+                _freeze_watchdog(parent)
+            panel = (parent._chain[-1] if getattr(parent, "_chain", None)
+                     else parent)
+            if extra in ("menu-move-view", "menu-move-action"):
+                group_rows = [item for item in panel._rows if not item.is_separator
+                              and item is not panel._back_row]
+                icons_ok = all(item.icon is not None for item in group_rows)
+                selected_ok = sum(bool(item.selected) for item in group_rows) == 1
+                px, py = parent.winfo_rootx(), parent.winfo_rooty()
+                sx, sy = panel.winfo_rootx(), panel.winfo_rooty()
+                overlap = (parent is not panel and
+                           px < sx + panel.winfo_width() and sx < px + parent.winfo_width()
+                           and py < sy + panel.winfo_height() and sy < py + parent.winfo_height())
+                wx, wy = app.winfo_rootx(), app.winfo_rooty()
+                inside = (sx >= wx and sy >= wy
+                          and sx + panel.winfo_width() <= wx + app.winfo_width()
+                          and sy + panel.winfo_height() <= wy + app.winfo_height())
+                print(f"  移动分组面板在软件内={inside} 与父菜单重叠={overlap} "
+                      f"图标齐全={icons_ok} 当前分组标记={selected_ok}")
+                regression_ok = (inside and not overlap and panel is parent
+                                 and icons_ok and selected_ok)
+                if extra == "menu-move-action":
+                    original = card.task.group_id
+                    target = next((g for g in app.store.groups if g.id != original), None)
+                    if target is None or not click_named(panel, target.name):
+                        raise AssertionError("移动分组子面板缺少其他分组")
+                    pump(0.3)
+                    moved = app.store.task(card.task.id).group_id == target.id
+                    closed = not parent.winfo_exists() and not ui_menu._ACTIVE
+                    print(f"  菜单移动分组：已移动={moved} 菜单关闭={closed}")
+                    regression_ok = regression_ok and moved and closed
+            else:
+                pump(0.65)
+                tops = []
+                _collect_toplevels(app, tops)
+                expected = {
+                    "menu-due-action": DuePickerDialog,
+                    "menu-due-clear-action": DuePickerDialog,
+                    "menu-edit-action": TaskDialog,
+                    "menu-delete-action": ConfirmDialog,
+                    "group-rename-action": PromptDialog,
+                    "group-icon-action": IconPickerPopup,
+                }[extra]
+                picker = next((w for w in tops if isinstance(w, expected)
+                               and w.winfo_exists()), None)
+                grab = app.grab_current()
+                grab_ok = (expected is IconPickerPopup or
+                           (picker is not None and grab is not None
+                            and str(grab.winfo_toplevel()._w) == str(picker._w)))
+                menu_closed = not parent.winfo_exists() and not ui_menu._ACTIVE
+                picker_ready = bool(picker and picker.winfo_viewable() and grab_ok)
+                above = _above_in_window_stack(picker, app) if picker else None
+                print(f"  {extra}：菜单关闭={menu_closed} "
+                      f"目标窗口可见且 grab 正确={picker_ready} "
+                      f"目标窗口高于主窗口={above}")
+                regression_ok = (menu_closed and picker_ready and
+                                 (above is True if os.name == "nt" else above is not False))
+                if extra == "menu-due-clear-action" and picker is not None:
+                    picker._clear()
+                    pump(0.4)
+                    cleared = app.store.task(card.task.id).due_date is None
+                    picker_closed = not picker.winfo_exists()
+                    print(f"  日期窗清除截止日期：已清除={cleared} 弹窗关闭={picker_closed}")
+                    regression_ok = regression_ok and cleared and picker_closed
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL 任务菜单子选项回归：{exc}")
+            regression_ok = False
 
     elif extra == "groupmenu":
         # 分组菜单（本轮需求 ④）：同样给确定坐标
@@ -561,6 +1057,29 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         except Exception as exc:  # noqa: BLE001
             print(f"  确认弹窗弹出失败：{exc}")
 
+    elif extra in ("toast", "toast-action"):
+        # Toast 浮层：检查圆角窗口裁切在普通提示与完成提示两种布局下均有效。
+        try:
+            if extra == "toast-action":
+                app.toast_widget.show("已删除任务", duration=6000,
+                                      action_label="撤销", action_command=lambda: None)
+            else:
+                app.toast_widget.show("今天的任务都完成了，光是你的了", duration=6000,
+                                      celebration=True)
+            pump(0.35)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Toast 弹出失败：{exc}")
+
+    elif extra == "toast-done":
+        # 完成卡的淡绿色背景曾被拿来填整个 Toast 原生窗口，圆角外泄露绿块。
+        try:
+            card = next(card for card in app.page.card_map.values() if card.task.done)
+            app.toast_widget.show("你把今天的光都收进了口袋", duration=6000,
+                                  anchor=card.check, celebration=True)
+            pump(0.35)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  完成任务 Toast 弹出失败：{exc}")
+
     elif extra == "iconpicker":
         # 图标选择浮层（需求 ⑥）：12 格网格。
         # 必须显式给坐标 —— ``popup_icon_picker`` 缺省按真实指针居中弹出，
@@ -592,13 +1111,15 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         except Exception as exc:  # noqa: BLE001
             print(f"  空状态构造失败：{exc}")
 
-    elif extra == "alldone":
-        # 全部完成态："今天的光都拾起来了"（需求 ④ 的第三个状态）
+    elif extra in ("alldone", "alldone-narrow"):
+        # 全部完成态与最窄窗口排版。
         try:
             for _t in list(app.store.all_tasks()):
                 app.store.update_task(_t.id, done=True)
             app.store.save()
             app.page.render()
+            if extra == "alldone-narrow":
+                app.geometry("392x600")
             pump(0.7)
         except Exception as exc:  # noqa: BLE001
             print(f"  全部完成态构造失败：{exc}")
@@ -916,17 +1437,15 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
                       f"tooltip {len(tips_before)}→{len(tips_after)} "
                       f"（{'✅符合预期' if got == want else '❌不符'}）")
                 if tips_after:
-                    # 1.5.30：确认外层方框已被色键抠掉（透明区会露出背后的卡片）
                     t0 = tips_after[0]
-                    try:
-                        key = theme.c("bg")
-                        tc = str(t0.attributes("-transparentcolor") or "")
-                        print(f"  Toplevel：overrideredirect="
-                              f"{bool(t0.overrideredirect())} bg={t0.cget('bg')!r} "
-                              f"透明色键={tc!r}（期望 {key!r} "
-                              f"{'✅' if tc.lower() == key.lower() else '❌'}）")
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  透明色键读取失败：{exc}")
+                    native_ok = _native_round_region_ok(t0)
+                    canvas = next((w for w in t0.winfo_children()
+                                   if isinstance(w, tk.Canvas)), None)
+                    canvas_ok = bool(canvas and int(canvas.cget("highlightthickness")) == 0)
+                    print(f"  无边框={bool(t0.overrideredirect())} "
+                          f"原生圆角={native_ok} Canvas 无高亮={canvas_ok}")
+                    regression_ok = regression_ok and native_ok and canvas_ok
+                regression_ok = regression_ok and got == want
         except Exception as exc:  # noqa: BLE001
             print(f"  悬停提示场景构造失败：{exc}")
 
@@ -969,6 +1488,16 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
     # 浮层（日期选择器 / 右键菜单）都是独立 Toplevel，且都不带 -topmost。
     # 主窗口为了截图被强行置顶了，于是浮层永远压在它下面、截出来只有主窗口。
     # 这里统一把浮层也顶上去，等 z-order 重排完再抓图。
+    if extra in ("menu-due-action", "menu-due-clear-action",
+                 "menu-move-view", "menu-move-action",
+                 "menu-edit-action", "menu-delete-action",
+                 "group-rename-action", "group-icon-action"):
+        # 断言已经在自然 Z 序下完成；截图时再把测试应用抬到桌面前面，避免
+        # 抓进当前用户正在看的其他窗口而误判这张菜单的视觉效果。
+        try:
+            app.attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
     _raise_floating(app)
     # 坐标已经是**物理像素**，不要再乘缩放系数。
     #
@@ -1005,6 +1534,13 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
             right, bottom = max(right, cx + cw), max(bottom, cy + ch)
         except Exception:  # noqa: BLE001
             continue
+    if extra in ("prompt", "taskdialog", "due", "about", "confirm",
+                 "quickadd", "iconpicker", "menu", "toast", "toast-done",
+                 "toast-action") and os.name == "nt":
+        mapped = [child for child in toplevels if child.winfo_ismapped()]
+        rounded = bool(mapped) and all(_native_round_region_ok(child) for child in mapped)
+        regression_ok = regression_ok and rounded
+        print(f"  原生圆角：{'通过' if rounded else '失败'}  窗口数={len(mapped)}")
     bbox = (left, top, right, bottom)
     image = _grab_checked(bbox, app=app)
     if image is None:
@@ -1018,6 +1554,22 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         except Exception:  # noqa: BLE001
             pass
         return 1
+    if extra in ("prompt", "taskdialog", "due", "about", "confirm"):
+        popup = next((child for child in toplevels if child.winfo_ismapped()), None)
+        if popup is not None:
+            radius = theme.lpx(theme.CONFIRM_RADIUS if extra == "confirm"
+                               else theme.RADIUS_MENU) + 2
+            border_ok, widths, corners = _uniform_window_border(
+                image, bbox, popup, theme.c("window_border"), radius)
+            regression_ok = regression_ok and border_ok
+            print(f"  四边描边：{'通过' if border_ok else '失败'}  "
+                  f"像素={widths} 四角连续={corners}")
+    if extra in ("toast", "toast-done", "toast-action"):
+        border_ok, widths, corners = _uniform_window_border(
+            image, bbox, app.toast_widget, theme.c("toast_border"), theme.lpx(theme.TOAST_RADIUS))
+        regression_ok = regression_ok and border_ok
+        print(f"  Toast 描边：{'通过' if border_ok else '失败'} "
+              f"像素={widths} 四角连续={corners}")
     scale = 1.0
 
     if not out_path:
@@ -1045,7 +1597,7 @@ def capture(out_path: str = "", mode: str = "", page: str = "tasks",
         app.destroy()
     except Exception:  # noqa: BLE001
         pass
-    return 0
+    return 0 if regression_ok else 1
 
 
 def capture_all() -> int:
@@ -1156,17 +1708,25 @@ def main() -> int:
     parser.add_argument("out", nargs="?", default="", help="输出 PNG 路径")
     parser.add_argument("--mode", default="", choices=["", "Light", "Dark"])
     parser.add_argument("--page", default="tasks", choices=["tasks", "stats", "settings"])
+    parser.add_argument("--scroll", type=float, default=0.0,
+                        help="页面滚动位置（0.0 到 1.0，检查长页面下半部分）")
     parser.add_argument("--no-demo", action="store_true", help="使用真实数据目录")
     parser.add_argument("--all", action="store_true", help="批量输出全部预览图")
-    parser.add_argument("--extra", default="", help="抓图场景：banner / quickadd / "
-                        "menu / groupmenu / due / duetime / duehour / remind / "
-                        "confirm / iconpicker / empty / alldone / resized / "
+    parser.add_argument("--extra", default="", help="抓图场景：banner / quickadd / filter / filter-narrow / "
+                        "menu / menu-due-action / menu-due-clear-action / "
+                        "menu-move-view / menu-move-action / "
+                        "menu-edit-action / menu-delete-action / group-rename-action / "
+                        "group-icon-action / groupmenu / due / duetime / duehour / remind / "
+                        "groupdropdown / prompt / taskdialog / about / search / "
+                        "taskdialog-due / quickadd-due / "
+                        "search-empty / confirm / toast / toast-done / toast-action / "
+                        "iconpicker / empty / alldone / alldone-narrow / nav-focus / resized / "
                         "narrow / checked / states / scrolled / bar / sparse")
     args = parser.parse_args()
     if args.all:
         return capture_all()
     return capture(args.out, mode=args.mode, page=args.page, demo=not args.no_demo,
-                   extra=args.extra)
+                   scroll=args.scroll, extra=args.extra)
 
 
 if __name__ == "__main__":

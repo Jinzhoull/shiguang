@@ -34,6 +34,7 @@ import tkinter as tk
 from typing import Dict, List, Optional, Tuple
 
 import customtkinter as ctk
+from . import theme
 
 try:                                    # Pillow 是硬依赖，但不该在导入期就炸掉整个应用
     from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
@@ -45,12 +46,12 @@ except Exception:                       # noqa: BLE001
 log = logging.getLogger("shiguang.icons")
 
 # ---- 尺寸档位（需求 13/16）----
-SIZE_MAIN = 18        # 常规图标
-SIZE_GROUP = 16       # 分组标题图标
-SIZE_SMALL = 14       # 紧凑场景
+SIZE_MAIN = theme.ICON_SIZE_MAIN        # 常规图标
+SIZE_GROUP = theme.ICON_SIZE_GROUP       # 分组标题图标
+SIZE_SMALL = theme.ICON_SIZE_SMALL       # 紧凑场景
 SIZES = (SIZE_MAIN, SIZE_GROUP, SIZE_SMALL)
 
-SUPERSAMPLE = 4
+SUPERSAMPLE = theme.BITMAP_SS
 
 
 def ctk_source_px(size: int) -> int:
@@ -69,25 +70,25 @@ def ctk_source_px(size: int) -> int:
     return max(int(size), int(round(size * scale)))
 
 # ---- 品牌暖色（需求 15）----
-ORANGE = "#E89A4A"        # 柔橘
-GOLD = "#E8B84A"          # 暖阳金
-DEEP_GOLD = "#D4B872"     # 淡金
-VERMILION = "#E0553F"     # 番茄钟朱红
-RED = "#C0392B"           # 优先级高
-BLUE = "#6B93C4"          # 编辑：柔和蓝
-SALMON = "#C97B6B"        # 删除：柔和红
-BROWN = "#6B5F52"         # 更多选项：深灰棕
-WARM_BROWN = "#B08D57"    # 分组·工作：袋身暖棕
-WARM_CLASP = "#D4B887"    # 分组·工作：搭扣淡金
-SOFT_BLUE = "#7BA3C9"     # 分组·学习：封面柔和蓝
-PAGE_BLUE = "#A8C4DE"     # 分组·学习：书页浅蓝
-GRASS = "#8FB887"         # 分组·生活：主叶草绿
-GRASS_LIGHT = "#C2DDBE"   # 分组·生活：浅叶
-LEAF = "#5C9E4A"          # 番茄叶子
+ORANGE = theme.ICON_PALETTE["orange"]        # 柔橘
+GOLD = theme.ICON_PALETTE["gold"]          # 暖阳金
+DEEP_GOLD = theme.ICON_PALETTE["deep_gold"]     # 淡金
+VERMILION = theme.ICON_PALETTE["vermilion"]     # 番茄钟朱红
+RED = theme.ICON_PALETTE["red"]           # 优先级高
+BLUE = theme.ICON_PALETTE["blue"]          # 编辑：柔和蓝
+SALMON = theme.ICON_PALETTE["salmon"]        # 删除：柔和红
+BROWN = theme.ICON_PALETTE["brown"]         # 更多选项：深灰棕
+WARM_BROWN = theme.ICON_PALETTE["warm_brown"]    # 分组·工作：袋身暖棕
+WARM_CLASP = theme.ICON_PALETTE["warm_clasp"]    # 分组·工作：搭扣淡金
+SOFT_BLUE = theme.ICON_PALETTE["soft_blue"]     # 分组·学习：封面柔和蓝
+PAGE_BLUE = theme.ICON_PALETTE["page_blue"]     # 分组·学习：书页浅蓝
+GRASS = theme.ICON_PALETTE["grass"]         # 分组·生活：主叶草绿
+GRASS_LIGHT = theme.ICON_PALETTE["grass_light"]   # 分组·生活：浅叶
+LEAF = theme.ICON_PALETTE["leaf"]          # 番茄叶子
 
 # 内阴影强度（需求 17：右下叠半透明黑、左上叠半透明白，做出微立体感）
-INNER_SHADOW_DARK = 0.16  # 右下角黑色叠加比例
-INNER_SHADOW_LIGHT = 0.22 # 左上角白色叠加比例
+INNER_SHADOW_DARK = theme.ICON_INNER_SHADOW_DARK  # 右下角黑色叠加比例
+INNER_SHADOW_LIGHT = theme.ICON_INNER_SHADOW_LIGHT # 左上角白色叠加比例
 
 # 分组图标候选（key -> 中文名），供"更换图标"浮层使用。
 # 需求 26 指定的 12 个：公文包 / 书本 / 叶子 / 太阳 / 星星 / 咖啡 / 灯泡 / 心 / 旗 / 铃 / 笔 / 房子。
@@ -276,6 +277,20 @@ def _draw_calendar(size: int, color: str = ORANGE):
     return img
 
 
+def _draw_search(size: int):
+    """搜索：干净的圆环镜片与圆头短柄，小尺寸下仍清晰可辨。"""
+    img = _new_canvas(size)
+    draw = ImageDraw.Draw(img)
+    color = _rgb(BROWN) + (255,)
+    width = max(2, int(size * 0.105))
+    # 镜片略偏左上，给右下方的柄留出呼吸空间。
+    box = (size * 0.16, size * 0.14, size * 0.66, size * 0.64)
+    draw.ellipse(box, outline=color, width=width)
+    _line(draw, [(size * 0.58, size * 0.58),
+                 (size * 0.84, size * 0.84)], color, width)
+    return img
+
+
 def _draw_pomodoro(size: int):
     """番茄钟：朱红圆角番茄 + 两片小叶子（需求 15）。"""
     img = _new_canvas(size)
@@ -285,7 +300,7 @@ def _draw_pomodoro(size: int):
     d.ellipse((size * 0.13, size * 0.26, size * 0.87, size * 0.92), fill=body)
     # 顶部高光，做出圆润感
     d.ellipse((size * 0.28, size * 0.36, size * 0.52, size * 0.54),
-              fill=_rgb("#F08070") + (150,))
+              fill=_rgb(theme.ICON_PALETTE["tomato_highlight"]) + (150,))
     # 两片叶子
     leaf = _rgb(LEAF) + (255,)
     d.polygon([(size * 0.50, size * 0.27),
@@ -595,7 +610,7 @@ def _draw_heart(size: int):
         y = (13 * math.cos(t) - 5 * math.cos(2 * t)
              - 2 * math.cos(3 * t) - math.cos(4 * t))
         pts.append((cx + x * k, cy - y * k))
-    d.polygon(pts, fill=_rgb("#D98A7A") + (255,))
+    d.polygon(pts, fill=_rgb(theme.ICON_PALETTE["heart_light"]) + (255,))
     return img
 
 
@@ -871,7 +886,7 @@ def _draw_close_hover(size: int):
     """关闭按钮的 hover 态：朱红 ×。"""
     img = _new_canvas(size)
     d = ImageDraw.Draw(img)
-    c = _rgb("#C97B6B") + (255,)
+    c = _rgb(theme.ICON_PALETTE["salmon"]) + (255,)
     w = max(2, int(size * 0.10))
     _line(d, [(size * 0.30, size * 0.30), (size * 0.70, size * 0.70)], c, w)
     _line(d, [(size * 0.70, size * 0.30), (size * 0.30, size * 0.70)], c, w)
@@ -967,7 +982,7 @@ def _draw_warning(size: int):
     white = (255, 255, 255, 255)
     d.polygon([(size * 0.50, size * 0.10), (size * 0.94, size * 0.86),
                (size * 0.06, size * 0.86)], fill=white)
-    bar = _rgb("#C0392B") + (255,)
+    bar = _rgb(theme.ICON_PALETTE["red"]) + (255,)
     _line(d, [(size * 0.50, size * 0.36), (size * 0.50, size * 0.62)], bar,
           max(2, int(size * 0.10)))
     r = size * 0.055
@@ -979,6 +994,7 @@ def _draw_warning(size: int):
 # 图标注册表：name -> 绘制函数（入参是超采样尺寸）
 _PAINTERS = {
     "check": _draw_check,
+    "search": _draw_search,
     "calendar": _draw_calendar,
     "pomodoro": _draw_pomodoro,
     "more": _draw_more,
@@ -989,10 +1005,10 @@ _PAINTERS = {
     "chevron": _draw_chevron,
     "chevron_up": lambda s: _draw_chevron(s, up=True),
     "chevron_right": lambda s: _draw_chevron(s, direction="right"),
-    "chevron_white": lambda s: _draw_chevron(s, color="#FFFFFF", width_ratio=0.13),
-    "chevron_up_white": lambda s: _draw_chevron(s, up=True, color="#FFFFFF",
+    "chevron_white": lambda s: _draw_chevron(s, color=theme.ON_ACCENT[0], width_ratio=0.13),
+    "chevron_up_white": lambda s: _draw_chevron(s, up=True, color=theme.ON_ACCENT[0],
                                                 width_ratio=0.13),
-    "calendar_white": lambda s: _draw_calendar(s, color="#FFFFFF"),
+    "calendar_white": lambda s: _draw_calendar(s, color=theme.ON_ACCENT[0]),
     "star": _draw_star,
     "toast_sparkle": _draw_toast_sparkle,
     "home": _draw_home,
@@ -1199,7 +1215,7 @@ def get_pil(name: str, size: int, dark: Optional[bool] = None):
     return _render_pil(key, max(1, int(size)), bool(dark))
 
 
-def get_pil_tinted(name: str, size: int, color: str = "#FFFFFF",
+def get_pil_tinted(name: str, size: int, color: str = theme.ON_ACCENT[0],
                    dark: Optional[bool] = None):
     """取一张换成指定颜色的 **RGBA 图标**（物理像素，离线绘制用）。
 
@@ -1315,7 +1331,7 @@ def _tint_pil(img, color: str):
         return img
 
 
-def get_ctk_tinted(name: str, size: int = SIZE_MAIN, color: str = "#FFFFFF",
+def get_ctk_tinted(name: str, size: int = SIZE_MAIN, color: str = theme.ON_ACCENT[0],
                    dark: Optional[bool] = None):
     """取一张换成指定颜色的 ``CTkImage``（带缓存）。"""
     if not name or not _PIL_OK:
@@ -1378,7 +1394,7 @@ def get_ctk_chevron_rotated(size: int, angle: float, color: str = "",
     return image
 
 
-def get_tinted(name: str, size: int = SIZE_MAIN, color: str = "#FFFFFF",               dark: Optional[bool] = None):
+def get_tinted(name: str, size: int = SIZE_MAIN, color: str = theme.ON_ACCENT[0],               dark: Optional[bool] = None):
     """取一张**换成指定颜色**的 ``tk.PhotoImage``（Canvas 用，带缓存）。
 
     与 :func:`get_ctk_tinted` 的分工：那个给 CTk 控件（返回 ``CTkImage``），

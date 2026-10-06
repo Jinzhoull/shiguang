@@ -21,7 +21,7 @@ from .tk_text_bitmap import label_text_image
 
 def _font(role: str):
     return (fonts.pil_font(role)
-            or ImageFont.truetype("msyh.ttc", theme.lpx(theme.font_size(role))))
+            or ImageFont.truetype(fonts.FALLBACK_FONT_FILE, theme.lpx(theme.font_size(role))))
 
 
 def _text_width(font, value: str) -> int:

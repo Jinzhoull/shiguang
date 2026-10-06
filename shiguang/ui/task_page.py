@@ -28,8 +28,9 @@ import customtkinter as ctk
 from .. import icons, sound, stats, strings, theme
 from ..config import data_dir
 from ..models import (PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_MID, REMIND_DEFAULT,
-                      remind_label, sort_key)
+                      remind_label, sort_key, task_matches_filter)
 from . import dialogs, due_picker, widgets
+from .dropdown import InAppDropdown
 from .task_card import GroupCard, TaskCard
 
 WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -41,7 +42,7 @@ WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五",
 class DragManager:
     """统一处理任务卡片的拖拽落点计算。"""
 
-    THRESHOLD = 5
+    THRESHOLD = theme.TASK_DRAG_THRESHOLD
 
     def __init__(self, page: "TaskPage") -> None:
         self.page = page
@@ -56,6 +57,8 @@ class DragManager:
         root.bind("<ButtonRelease-1>", self.on_release, add="+")
 
     def on_press(self, task_id: str, event: tk.Event) -> None:
+        if self.page.has_active_filter:
+            return
         self.task_id = task_id
         self._pending = True
         self.active = False
@@ -203,9 +206,9 @@ class DueBanner(tk.Frame):
     的成因；渐入动画只动底色、不动几何，与抖动无涉。
     """
 
-    FADE_STEPS = 45
-    FADE_INTERVAL = 40        # 45 × 40ms = 1.8s 名义值 ≈ 实际 2 秒
-    _SS = 4                   # 超采样倍率（与 widgets._AA_SS 同值）
+    FADE_STEPS = theme.BANNER_FADE_STEPS
+    FADE_INTERVAL = theme.BANNER_FADE_INTERVAL        # 45 × 40ms = 1.8s 名义值 ≈ 实际 2 秒
+    _SS = theme.BANNER_BITMAP_SS                   # 超采样倍率（与 widgets._AA_SS 同值）
 
     def __init__(self, master: tk.Misc, app) -> None:
         self._bg_key = "banner_over"         # 底色键（强调色，见 refresh）
@@ -409,7 +412,7 @@ class DueBanner(tk.Frame):
                 self.configure(height=head)
             return
         w = max(2, self.winfo_width())
-        line_h = theme.lpx(20)
+        line_h = theme.lpx(theme.BANNER_DETAIL_LINE_H)
         try:
             from .. import fonts
             dfont = fonts.pil_font("tiny", theme.BANNER_DETAIL_FONT_DELTA)
@@ -439,12 +442,25 @@ class DueBanner(tk.Frame):
         # 去重键带上底色键、展开态与明细条数：换主题、切"逾期/今日到期"、展开
         # 折叠都会改变画面，只有真一样时才跳过（refresh 另外会显式清空一次）。
         key = (w, h, self._bg_key, self._expanded,
-               len(self._detail_items), self._detail_more, round(fade, 3))
+               self._head_text, tuple(self._detail_items), self._detail_more,
+               theme.is_dark(), round(fade, 3))
         if key == self._draw_key:
             return
         self._draw_key = key
+        from PIL import ImageTk
+        image = self.render_image(w, h, fade)
+        if image is None:
+            return
+        self._photo = ImageTk.PhotoImage(image, master=self)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self._preview_size = None
+        self._rendered_expanded = self._expanded
+
+    def render_image(self, w: int, h: int, fade: float = 1.0):
+        """生成实际横幅位图；可在 withdrawn 根窗口下进行离屏验证。"""
         try:
-            from PIL import Image, ImageDraw, ImageTk
+            from PIL import Image, ImageDraw
         except Exception:  # noqa: BLE001
             return
         try:
@@ -561,17 +577,7 @@ class DueBanner(tk.Frame):
                 baseline = row_top + (line_h - (asc + desc)) / 2 + asc
                 draw.text((indent, baseline), strings.TITLE_ELLIPSIS,
                           font=detail_font, anchor="ls", fill=date_c)
-        try:
-            photo = ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
-        except Exception:  # noqa: BLE001
-            logging.getLogger(__name__).warning(
-                "DueBanner 位图转换失败", exc_info=True)
-            return
-        self._photo = photo                    # 必须持引用，否则被 GC
-        self.canvas.delete("all")              # 先删后画，绝无叠加
-        self.canvas.create_image(0, 0, anchor="nw", image=photo)
-        self._preview_size = None
-        self._rendered_expanded = self._expanded
+        return big.resize((w, h), Image.LANCZOS)
 
     def _draw_icon(self, draw, x: int, cy: int, ss: int) -> None:
         """横幅左侧图标：**琥珀黄实心 + 深橘描边 + 感叹号**（1.5.29 重绘）。
@@ -740,6 +746,14 @@ class DueBanner(tk.Frame):
 # 任务主页
 # --------------------------------------------------------------------------
 class TaskPage(ctk.CTkFrame):
+    FILTER_KEYS = {
+        strings.TASK_FILTER_OPTIONS[0]: "all",
+        strings.TASK_FILTER_OPTIONS[1]: "today",
+        strings.TASK_FILTER_OPTIONS[2]: "overdue",
+        strings.TASK_FILTER_OPTIONS[3]: "open",
+        strings.TASK_FILTER_OPTIONS[4]: "done",
+    }
+
     def __init__(self, master: tk.Misc, app) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
@@ -747,9 +761,11 @@ class TaskPage(ctk.CTkFrame):
         self.group_cards: Dict[str, GroupCard] = {}
         self.card_map: Dict[str, TaskCard] = {}
         self.drag = DragManager(self)
+        self.filter_key = "all"
+        self._search_job: Optional[str] = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         # ---- 统计条 ----
         self.summary = SummaryCard(self, app)
@@ -760,6 +776,64 @@ class TaskPage(ctk.CTkFrame):
         self.banner.grid(row=1, column=0, sticky="ew", pady=(0, theme.PAGE_GAP))
         self.banner.grid_remove()
 
+        # ---- 搜索与筛选 ----
+        self.search_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self.search_bar.grid(row=2, column=0, sticky="ew",
+                             pady=(0, theme.lpx(theme.PAGE_GAP)))
+        self.search_bar.grid_columnconfigure(0, weight=1)
+        self.search_shell = ctk.CTkFrame(
+            self.search_bar, height=32, corner_radius=16,
+            fg_color=theme.pair("card"), border_width=1,
+            border_color=theme.pair("control_border"))
+        self.search_shell.grid(row=0, column=0, sticky="ew",
+                               padx=(0, theme.lpx(8)))
+        self.search_shell.grid_propagate(False)
+        self.search_shell.grid_columnconfigure(1, weight=1)
+        # 清除按钮隐藏时，grid_remove() 默认会把第 2 列一并收缩；Entry
+        # 随之铺到外壳最右边，方角盖住圆角外壳右上/右下角。固定保留按钮槽，
+        # 让空搜索和有内容两种状态使用完全相同的输入区宽度。
+        self.search_shell.grid_columnconfigure(
+            2, minsize=theme.lpx(30))
+        self.search_shell.grid_rowconfigure(0, weight=1)
+        self._search_icon_image = icons.get_ctk("search", icons.SIZE_SMALL)
+        self.search_icon = ctk.CTkLabel(
+            self.search_shell, text="", image=self._search_icon_image,
+            width=18, fg_color="transparent")
+        self.search_icon.grid(row=0, column=0, padx=(10, 3))
+        self.search_entry = ctk.CTkEntry(
+            self.search_shell, placeholder_text=strings.TASK_SEARCH_HINT,
+            font=theme.font("small"), height=28, corner_radius=0,
+            fg_color="transparent", border_width=0,
+            text_color=theme.pair("text"),
+            placeholder_text_color=theme.pair("text_done"),
+        )
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+        self.search_clear = widgets.IconButton(
+            self.search_shell, text="×", icon="close", icon_size=12,
+            size=24, radius=12, fg="transparent",
+            hover=theme.pair("ghost_hover"),
+            text_color=theme.pair("text_muted"),
+            command=self._clear_search,
+        )
+        self.search_clear.grid(row=0, column=2, padx=(2, 4))
+        self.search_clear.grid_remove()
+        self.search_entry.bind(
+            "<FocusIn>", lambda _e: self.search_shell.configure(
+                border_color=theme.pair("accent")), add="+")
+        self.search_entry.bind(
+            "<FocusOut>", lambda _e: self.search_shell.configure(
+                border_color=theme.pair("control_border")), add="+")
+        self.search_entry.bind("<KeyRelease>", self._queue_search_render, add="+")
+        self.search_entry.bind("<Return>", self._render_search_now, add="+")
+        self.search_entry.bind("<Escape>", self._clear_search, add="+")
+        self.filter_menu = InAppDropdown(
+            self.search_bar, values=list(self.FILTER_KEYS), width=106, height=32,
+            min_popup_width=150, title="任务筛选", anchor="center",
+            command=self._set_filter,
+        )
+        self.filter_menu.set(strings.TASK_FILTER_OPTIONS[0])
+        self.filter_menu.grid(row=0, column=1, sticky="e")
+
         # ---- 分组滚动区 ----
         # height 必须给一个"小"的初值：滚动区的内容高度会被当作请求高度上报，
         # 若不限制，它会把整个窗口的请求高度顶起来。
@@ -767,7 +841,7 @@ class TaskPage(ctk.CTkFrame):
         self.scroll = widgets.ThinScrollFrame(
             self, height=200,
         )
-        self.scroll.grid(row=2, column=0, sticky="nsew")
+        self.scroll.grid(row=3, column=0, sticky="nsew")
         self.scroll.grid_columnconfigure(0, weight=1)
 
         # ---- 快速添加：不再有底部常驻输入栏（改动一）----
@@ -783,7 +857,83 @@ class TaskPage(ctk.CTkFrame):
 
     def _set_default_group(self, group_id: str) -> None:
         self.store.set_setting("default_group", group_id)
-        self.store.save()
+        self.app.save_data()
+
+    @property
+    def has_active_filter(self) -> bool:
+        return (self.filter_key != "all"
+                or bool(self.search_entry.get().strip()))
+
+    def _queue_search_render(self, _event=None) -> None:
+        self._sync_search_clear()
+        if self._search_job is not None:
+            try:
+                self.after_cancel(self._search_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._search_job = self.after(140, self._render_search_now)
+
+    def _render_search_now(self, _event=None) -> str:
+        if self._search_job is not None:
+            try:
+                self.after_cancel(self._search_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._search_job = None
+        self.render()
+        return "break"
+
+    def _sync_search_clear(self) -> None:
+        """只有存在查询文字时才显示清除叉，且它只清搜索内容。"""
+        try:
+            if self.search_entry.get():
+                self.search_clear.grid()
+            else:
+                self.search_clear.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_filter(self, label: str) -> None:
+        self.filter_key = self.FILTER_KEYS.get(label, "all")
+        self.render()
+
+    def _clear_search(self, _event=None) -> str:
+        self.search_entry.delete(0, "end")
+        self._sync_search_clear()
+        self._render_search_now()
+        try:
+            self.search_entry.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
+        return "break"
+
+    def clear_filters(self) -> None:
+        self.filter_key = "all"
+        self.filter_menu.set(strings.TASK_FILTER_OPTIONS[0])
+        self.search_entry.delete(0, "end")
+        self._sync_search_clear()
+        self.render()
+
+    def _matches_filter(self, task, query: str) -> bool:
+        return task_matches_filter(task, query=query, filter_key=self.filter_key)
+
+    def _render_no_results(self) -> None:
+        holder = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        holder.pack(fill="x", padx=theme.lpx(12), pady=theme.lpx(28))
+        widgets.TextLabel(
+            holder, text=strings.TASK_FILTER_EMPTY_TITLE, font=theme.font("h2"),
+            text_color=theme.pair("text"), anchor="center",
+        ).pack(fill="x")
+        widgets.TextLabel(
+            holder, text=strings.TASK_FILTER_EMPTY_HINT, font=theme.font("small"),
+            text_color=theme.pair("text_muted"), anchor="center",
+        ).pack(fill="x", pady=(theme.lpx(4), theme.lpx(10)))
+        ctk.CTkButton(
+            holder, text=strings.TASK_FILTER_CLEAR, height=28, corner_radius=14,
+            fg_color=theme.pair("ghost"), hover_color=theme.pair("ghost_hover"),
+            text_color=theme.pair("text"), font=theme.font("small"),
+            command=self.clear_filters,
+        ).pack(anchor="center")
 
     def add_quick_task(self, title: str, group_id: str = "",
                        due_date=None, remind_offset=REMIND_DEFAULT) -> None:
@@ -802,7 +952,7 @@ class TaskPage(ctk.CTkFrame):
             return
         task = self.store.add_task(title, grp.id, PRIORITY_MID, due_date=due_date,
                                    remind_offset=remind_offset)
-        self.store.save()
+        self.app.save_data()
         self.render()
         self._refresh_chrome()
         card = self.card_map.get(task.id)
@@ -823,22 +973,35 @@ class TaskPage(ctk.CTkFrame):
 
         self.banner.refresh()
 
-        tasks_total = len(self.store.all_tasks())
+        all_tasks = self.store.all_tasks()
+        tasks_total = len(all_tasks)
         if tasks_total == 0:
             self._render_empty_state(has_tasks=False, all_done=False)
             self.summary.update_data()
             return
 
+        query = self.search_entry.get().strip().casefold()
+        visible_tasks = [t for t in all_tasks if self._matches_filter(t, query)]
+        if self.has_active_filter and not visible_tasks:
+            self._render_no_results()
+            self.summary.update_data()
+            return
+        visible_ids = {task.id for task in visible_tasks}
+
         # "全部完成"是第三个空状态（需求 ④）。它**不替换**任务列表 ——
         # 全做完就把完成的东西藏起来，用户想复查或撤销都没地方点。
         # 所以只在列表上方加一条轻量的完成态卡片。
-        if stats.all_done_today(self.store):
+        if not self.has_active_filter and stats.all_done_today(self.store):
             self._render_empty_state(has_tasks=True, all_done=True)
 
         for grp in self.store.groups:
-            tasks = self.store.tasks_in(grp.id)
+            tasks = [t for t in self.store.tasks_in(grp.id) if t.id in visible_ids]
+            if self.has_active_filter and not tasks:
+                continue
             card = GroupCard(self.scroll, self.app, grp, tasks,
-                             render_task=self._render_task, dispatch=self.dispatch)
+                             render_task=self._render_task, dispatch=self.dispatch,
+                             visible_task_ids=(visible_ids
+                                               if self.has_active_filter else None))
             card.pack(fill="x", padx=0, pady=(0, 1))
             self.group_cards[grp.id] = card
 
@@ -864,6 +1027,64 @@ class TaskPage(ctk.CTkFrame):
         # 修正。只给常量是不够的 —— 窗口被拖到最小尺寸（380 逻辑像素）时，
         # 380 逻辑宽的折行盒比卡片还宽，文字照样被裁。
         wrap = theme.EMPTY_WRAP
+
+        if all_done:
+            # 完成反馈采用居中纵向排布：太阳、文案和按钮共用同一中心线。
+            holder = ctk.CTkFrame(
+                self.scroll, corner_radius=theme.RADIUS_CARD,
+                fg_color=theme.pair("card"), border_width=1,
+                border_color=theme.pair("tooltip_border"))
+            holder.pack(fill="x", pady=(0, 0))
+            inner = ctk.CTkFrame(holder, fg_color="transparent", corner_radius=0)
+            inner.pack(fill="x", padx=theme.lpx(16), pady=theme.lpx(7))
+            badge = ctk.CTkFrame(
+                inner, width=32, height=32, corner_radius=16,
+                fg_color=theme.pair("accent_soft"))
+            badge.pack(anchor="center", pady=(0, theme.lpx(4)))
+            badge.pack_propagate(False)
+            try:
+                sun = icons.get_ctk("grp_sun", 20)
+            except Exception:  # noqa: BLE001
+                sun = None
+            ctk.CTkLabel(badge, text="", image=sun).place(
+                relx=0.5, rely=0.5, anchor="center")
+
+            title_label = widgets.TextLabel(
+                inner, text=title, font=theme.font("h2"),
+                text_color=theme.pair("text"), anchor="center", justify="center",
+                wraplength=wrap)
+            title_label.pack(fill="x")
+            hint_label = widgets.TextLabel(
+                inner, text=hint, font=theme.font("small"),
+                text_color=theme.pair("text_muted"), anchor="center", justify="center",
+                wraplength=wrap)
+            hint_label.pack(fill="x", pady=(theme.lpx(2), 0))
+            ctk.CTkButton(
+                inner, text=strings.FOCUS_CTA_AGAIN, width=116, height=28,
+                corner_radius=14, fg_color=theme.pair("accent"),
+                hover_color=theme.pair("accent_hover"),
+                text_color=theme.ON_ACCENT, font=theme.font("small"),
+                command=self.app.start_focus,
+            ).pack(anchor="center", pady=(theme.lpx(7), 0))
+
+            def _fit_done_labels(_event=None) -> None:
+                try:
+                    width = inner.winfo_width()
+                except Exception:  # noqa: BLE001
+                    return
+                if width == _fit_done_labels.last[0]:
+                    return
+                _fit_done_labels.last[0] = width
+                avail = int((width - theme.lpx(8)) / (theme.scale() or 1.0))
+                if avail > 40:
+                    title_label.configure(wraplength=avail)
+                    hint_label.configure(wraplength=avail)
+
+            _fit_done_labels.last = [0]
+            inner.bind("<Configure>", _fit_done_labels, add="+")
+            widgets.RESIZE_GATE.register(inner, _fit_done_labels)
+            self.after(0, _fit_done_labels)
+            return
 
         holder = ctk.CTkFrame(self.scroll, corner_radius=theme.RADIUS_CARD,
                               fg_color=theme.pair("card"),
@@ -950,16 +1171,6 @@ class TaskPage(ctk.CTkFrame):
                 text_color=theme.pair("text"), font=theme.font("small"),
                 command=self.app.start_focus,
             ).pack(pady=(0, theme.lpx(theme.EMPTY_PAD_BOTTOM)))
-        else:
-            # "全部完成"态：把原来的占位空标签换成"再专注一会儿"，
-            # 这一屏本来就没有别的可点的东西
-            ctk.CTkButton(
-                holder, text=strings.FOCUS_CTA_AGAIN, height=28, corner_radius=14,
-                fg_color=theme.pair("ghost"), hover_color=theme.pair("ghost_hover"),
-                text_color=theme.pair("text"), font=theme.font("small"),
-                command=self.app.start_focus,
-            ).pack(pady=(theme.lpx(theme.EMPTY_CTA_TOP),
-                         theme.lpx(theme.EMPTY_PAD_BOTTOM)))
 
     def _render_task(self, master: tk.Misc, task, index: int) -> TaskCard:
         card = TaskCard(
@@ -1009,17 +1220,19 @@ class TaskPage(ctk.CTkFrame):
         return nearest
 
     def apply_drop(self, task_id: str, group_id: str, index: int) -> None:
+        if self.has_active_filter:
+            return
         grp = self.store.group(group_id)
         if grp is None:
             return
         if grp.collapsed:
             grp.collapsed = False      # 拖到折叠分组时自动展开
         self.store.move_task_to(task_id, group_id, index)
-        self.store.save()
+        self.app.save_data()
         self.render()
 
     def finish_drag(self) -> None:
-        self.store.save()
+        self.app.save_data()
         self.render()
         self._refresh_chrome()
 
@@ -1040,17 +1253,11 @@ class TaskPage(ctk.CTkFrame):
         elif action == "move":
             task_id, group_id = payload
             self.store.update_task(task_id, group_id=group_id)
-            self.store.save()
+            self.app.save_data()
             self.render()
             self._refresh_chrome()
         elif action == "due":
             self._pick_due(payload)
-        elif action == "clear_due":
-            # 只清日期、**保留提醒设置**：提醒在弹窗里是跟着任务存的，
-            # 顺手清掉会让"下次再设时间"时悄悄退回"不提醒"。
-            _task = self.store.task(payload)
-            self._apply_due(payload, None,
-                            _task.remind_offset if _task is not None else None)
         elif action == "new_task":
             self.app.open_quick_add()
         elif action == "add_to_group":
@@ -1083,12 +1290,12 @@ class TaskPage(ctk.CTkFrame):
         card = self.group_cards.get(group_id)
         if card is None:
             self.store.toggle_group_collapsed(group_id)
-            self.store.save()
+            self.app.save_data()
             self.render()
             return
         collapsing = not grp.collapsed
         grp.collapsed = collapsing
-        self.store.save()
+        self.app.save_data()
         card.set_collapsed(collapsing)
         # 1.5.12：箭头不再瞬移换向 —— GroupCard 内部播 150ms 旋转动画
         # （只换图标位图，不动布局），折叠态同步切换浅米底衬。
@@ -1116,8 +1323,22 @@ class TaskPage(ctk.CTkFrame):
         if task is None:
             return
         group_id = task.group_id
+        self.app.reminder.forget(task_id)
         self.store.set_done(task_id, value)
-        self.store.save()
+        self.app.save_data()
+
+        if self.filter_key != "all":
+            self.render()
+            self._refresh_chrome()
+            if value:
+                self.app.sync_tray()
+                if stats.all_done_today(self.store):
+                    self.app.celebrate()
+                else:
+                    siblings = self.store.tasks_in(group_id)
+                    if siblings and all(t.done for t in siblings):
+                        self.app.celebrate(group_only=True)
+            return
 
         self._reorder_for(task_id)
 
@@ -1202,7 +1423,7 @@ class TaskPage(ctk.CTkFrame):
                 fields.get("due_date"),
             )
             task_id = task.id
-        self.store.save()
+        self.app.save_data()
         # 改了截止日期就清掉提醒记录，否则新时间不会再触发提醒
         if self.app.reminder is not None and task_id:
             self.app.reminder.forget(task_id)
@@ -1229,7 +1450,7 @@ class TaskPage(ctk.CTkFrame):
         # 日期与提醒一起写：两者在同一个弹窗里选，分两次落盘只会多一次
         # "改了一半"的中间态（而且 remind=None 的含义就是"不提醒"，不能当成没传）
         self.store.update_task(task_id, due_date=when, remind_offset=remind)
-        self.store.save()
+        self.app.save_data()
         # 时间被改过 -> 允许重新提醒（不然同一个任务改完时间就再也不会提醒了）
         if self.app.reminder is not None:
             self.app.reminder.forget(task_id)
@@ -1247,26 +1468,23 @@ class TaskPage(ctk.CTkFrame):
         task = self.store.task(task_id)
         if task is None:
             return
+        snapshot = task.to_dict()
         # 先拿到卡片引用：淡出动画需要它，而 render() 会重建卡片表
         card = self.card_map.get(task_id)
 
         def do_delete() -> None:
             def remove() -> None:
                 self.store.remove_task(task_id)
-                self.store.save()
+                self.app.save_data()
                 if self.app.reminder is not None:
                     self.app.reminder.forget(task_id)
-                self.card_map.pop(task_id, None)
-                group_card = self.group_cards.get(task.group_id)
-                if group_card is None:
-                    # 页面正处在重建/切换期时保留安全回退；常规删除走局部移除，
-                    # 不销毁重建其它分组和任务卡片。
-                    self.render()
-                elif not self.store.all_tasks():
-                    # 最后一项删除后需切到主页空状态。
-                    self.render()
-                else:
-                    if group_card.remove_task_card(task_id):
+                if self.app.page is self and self.winfo_exists():
+                    self.card_map.pop(task_id, None)
+                    group_card = self.group_cards.get(task.group_id)
+                    if (self.has_active_filter or not self.store.all_tasks()
+                            or group_card is None):
+                        self.render()
+                    elif group_card.remove_task_card(task_id):
                         group_card.update_count()
                         self.summary.update_data()
                         self.banner.refresh()
@@ -1274,7 +1492,27 @@ class TaskPage(ctk.CTkFrame):
                         self.render()
                 self._refresh_chrome()
                 self.app.sync_tray()
-                self.app.toast("已移除这一条，轻装继续")
+
+                def undo() -> None:
+                    restored = self.store.restore_task(snapshot)
+                    if restored is None:
+                        self.app.toast("这条任务暂时无法恢复")
+                        return
+                    self.app.save_data()
+                    if self.app.reminder is not None:
+                        self.app.reminder.forget(restored.id)
+                    current_page = self.app.page
+                    if isinstance(current_page, TaskPage):
+                        current_page.render()
+                    self.app.refresh_chrome()
+                    self.app.sync_tray()
+                    self.app.toast(strings.TASK_FILTER_RESTORE)
+
+                self.app.toast(
+                    "已移除这一条，轻装继续", duration=6000,
+                    action_label=strings.TASK_FILTER_UNDO,
+                    action_command=undo,
+                )
 
             # 先淡出再移除（需求 21）：直接消失会让人觉得"点错了"
             if card is not None:
@@ -1297,7 +1535,7 @@ class TaskPage(ctk.CTkFrame):
             if not text:
                 return
             grp.name = text
-            self.store.save()
+            self.app.save_data()
             self.render()
 
         dialogs.prompt(self.app, "重命名分组", "分组名称", grp.name, on_ok)
@@ -1337,7 +1575,7 @@ class TaskPage(ctk.CTkFrame):
         # 写入口做类型校验：非 str 直接拒绝并记日志（见 store.set_group_icon 注释）
         if not self.store.set_group_icon(group_id, icon):
             return
-        self.store.save()
+        self.app.save_data()
         self.render()
 
     def _delete_group(self, group_id: str) -> None:
@@ -1354,7 +1592,7 @@ class TaskPage(ctk.CTkFrame):
             self.store.remove_group(group_id, move_tasks_to=others[0].id)
             if self.store.settings.get("default_group") == group_id:
                 self.store.set_setting("default_group", others[0].id)
-            self.store.save()
+            self.app.save_data()
             self.render()
             self._sync_chip()
             self.app.toast(f"已删除分组，{count} 项任务移到「{others[0].name}」")

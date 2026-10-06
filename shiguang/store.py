@@ -60,6 +60,9 @@ class Store:
         self.groups: List[Group] = []
         self.tasks: List[Task] = []
         self.dirty = False
+        self.last_save_error = ""
+        self.load_warnings: List[str] = []
+        self.recovery_backup_path = ""
         self.load()
 
     # ------------------------------------------------------------------
@@ -67,6 +70,8 @@ class Store:
     # ------------------------------------------------------------------
     def load(self) -> None:
         raw: Dict[str, Any] = {}
+        self.load_warnings.clear()
+        quarantined = False
         if self.path.exists():
             try:
                 with open(self.path, "r", encoding="utf-8") as fh:
@@ -75,46 +80,155 @@ class Store:
                     raise ValueError("根节点不是对象")
             except Exception as exc:  # noqa: BLE001 - 任何损坏都要能恢复
                 self._quarantine(exc)
+                self.load_warnings.append("本地数据文件无法读取，已保留原文件副本并使用空白数据启动。")
+                quarantined = True
                 raw = {}
 
         base = default_data()
         settings = dict(base["settings"])
-        settings.update(raw.get("settings") or {})
+        raw_settings = raw.get("settings", {})
+        if isinstance(raw_settings, dict):
+            settings.update(raw_settings)
+        elif "settings" in raw:
+            self.load_warnings.append("设置内容格式异常，已恢复默认设置。")
+        # Settings are user-editable JSON too. A single malformed value must not
+        # break startup later (for example int("oops") in the focus timer).
+        bool_settings = {
+            "always_on_top", "close_to_tray", "hotkey_enabled", "sound_enabled",
+            "due_notify", "due_banner", "due_particles", "tray_tip_shown", "onboarded",
+        }
+        string_settings = {"font_family", "geometry", "window_geometry", "hotkey",
+                           "default_group"}
+        integer_ranges = {
+            "pomodoro_minutes": (1, 120), "break_minutes": (1, 60),
+            "due_soon_minutes": (1, 1440), "due_just_minutes": (1, 1440),
+        }
+        for key, default_value in base["settings"].items():
+            if key not in settings:
+                continue
+            value = settings[key]
+            invalid = False
+            if key in bool_settings:
+                invalid = type(value) is not bool
+            elif key in string_settings:
+                invalid = not isinstance(value, str)
+            elif key == "theme":
+                invalid = not isinstance(value, str) or value not in {"system", "light", "dark"}
+            elif key in integer_ranges:
+                low, high = integer_ranges[key]
+                try:
+                    if isinstance(value, bool):
+                        raise ValueError("布尔值不是时长")
+                    parsed = int(value)
+                    invalid = not low <= parsed <= high
+                    if not invalid and type(value) is not int:
+                        settings[key] = parsed
+                except (TypeError, ValueError, OverflowError):
+                    invalid = True
+            if invalid:
+                settings[key] = default_value
+                self.load_warnings.append(f"设置“{key}”格式异常，已恢复默认值。")
         # 旧数据文件里没有 group_icons（本轮新增），补齐并保证类型正确 ——
         # 用户手改过文件时它可能是任意类型，后续 set_group_icon 会直接写进去。
         if not isinstance(settings.get(self.GROUP_ICONS_KEY), dict):
+            if self.GROUP_ICONS_KEY in settings:
+                self.load_warnings.append("分组图标设置格式异常，已恢复默认图标。")
             settings[self.GROUP_ICONS_KEY] = {}
 
         groups_raw = raw.get("groups")
         if not isinstance(groups_raw, list) or not groups_raw:
+            if "groups" in raw:
+                if not isinstance(groups_raw, list):
+                    self.load_warnings.append("分组列表格式异常，已恢复默认分组。")
+                elif not groups_raw:
+                    self.load_warnings.append("分组列表为空，已恢复默认分组。")
             groups_raw = base["groups"]
         tasks_raw = raw.get("tasks") if isinstance(raw.get("tasks"), list) else []
-        history = raw.get("history") if isinstance(raw.get("history"), dict) else {}
-        focus = raw.get("focus_history") if isinstance(raw.get("focus_history"), dict) else {}
+        if "tasks" in raw and not isinstance(raw.get("tasks"), list):
+            self.load_warnings.append("任务列表格式异常，已恢复为空列表。")
+        history_raw = raw.get("history", {})
+        history = history_raw if isinstance(history_raw, dict) else {}
+        if "history" in raw and not isinstance(history_raw, dict):
+            self.load_warnings.append("完成历史格式异常，已恢复为空。")
+        focus_raw = raw.get("focus_history", {})
+        focus = focus_raw if isinstance(focus_raw, dict) else {}
+        if "focus_history" in raw and not isinstance(focus_raw, dict):
+            self.load_warnings.append("专注历史格式异常，已恢复为空。")
+
+        def safe_count(value: Any, label: str) -> int:
+            """读入统计计数时拒绝坏值，不让一个脏数字阻止整个应用启动。"""
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("布尔值不是计数")
+                number = int(value)
+                if isinstance(value, float) and value != number:
+                    raise ValueError("计数不能是小数")
+                if number < 0:
+                    raise ValueError("计数不能为负数")
+                return number
+            except (TypeError, ValueError, OverflowError):
+                self.load_warnings.append(f"{label}格式异常，已按 0 处理。")
+                return 0
+
+        safe_history = {
+            str(key): safe_count(value, "完成历史")
+            for key, value in history.items()
+        }
+        safe_focus = {
+            str(key): safe_count(value, "专注历史")
+            for key, value in focus.items()
+        }
+        version = safe_count(raw.get("version", DATA_VERSION), "数据版本") or DATA_VERSION
 
         self.data = {
-            "version": int(raw.get("version", DATA_VERSION)),
+            "version": version,
             "settings": settings,
-            "history": {str(k): int(v) for k, v in history.items()},
-            "total_completed": int(raw.get("total_completed", 0)),
+            "history": safe_history,
+            "total_completed": safe_count(raw.get("total_completed", 0), "累计完成数"),
             # 1.5.11：每日专注记录。旧文件缺字段按 0 处理（无需迁移），
             # 脏值（非 dict / 非数字）一律归零，不让坏数据把启动流程炸掉。
-            "focus_history": {str(k): int(v) for k, v in focus.items()},
-            "total_focus": int(raw.get("total_focus", 0) or 0),
+            "focus_history": safe_focus,
+            "total_focus": safe_count(raw.get("total_focus", 0), "累计专注数"),
         }
-        self.groups = [Group.from_dict(g) for g in groups_raw if isinstance(g, dict)]
-        self.tasks = [Task.from_dict(t) for t in tasks_raw if isinstance(t, dict)]
+        self.groups = []
+        for item in groups_raw:
+            if not isinstance(item, dict):
+                self.load_warnings.append("有一个分组记录格式异常，已跳过。")
+                continue
+            try:
+                self.groups.append(Group.from_dict(item))
+            except (TypeError, ValueError, OverflowError):
+                self.load_warnings.append("有一个分组记录无法读取，已跳过。")
+        self.tasks = []
+        for item in tasks_raw:
+            if not isinstance(item, dict):
+                self.load_warnings.append("有一条任务记录格式异常，已跳过。")
+                continue
+            try:
+                self.tasks.append(Task.from_dict(item))
+            except (TypeError, ValueError, OverflowError):
+                self.load_warnings.append("有一条任务记录无法读取，已跳过。")
         self._repair()
+        if self.load_warnings and not quarantined:
+            self._quarantine(ValueError("数据字段格式异常，已尽量恢复可读取内容"))
 
     def _quarantine(self, exc: Exception) -> None:
         """数据文件损坏时保留现场，避免静默丢数据。"""
+        self.recovery_backup_path = ""
         try:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             bad = self.path.with_name(f"data.corrupt-{stamp}.json")
+            suffix = 1
+            while bad.exists():
+                bad = self.path.with_name(f"data.corrupt-{stamp}-{suffix}.json")
+                suffix += 1
             shutil.copy2(self.path, bad)
-            self.log(f"数据文件解析失败({exc})，已备份到 {bad.name}，使用全新数据启动")
+            self.recovery_backup_path = str(bad)
+            self.log(f"数据文件解析失败({exc})，已备份到 {bad.name}")
+            if self.load_warnings:
+                self.load_warnings.append(f"原始数据副本已保存为 {bad.name}。")
         except Exception:  # noqa: BLE001
-            pass
+            self.log(f"数据文件备份失败：{exc}")
 
     def _repair(self) -> None:
         """修正脏数据：分组顺序、孤立任务、order 连续性。"""
@@ -126,6 +240,11 @@ class Store:
 
         valid_ids = {g.id for g in self.groups}
         fallback = self.groups[0].id
+        default_group = self.data["settings"].get("default_group")
+        if default_group not in valid_ids:
+            if default_group:
+                self.load_warnings.append("默认分组不存在，已改为第一个分组。")
+            self.data["settings"]["default_group"] = fallback
         for t in self.tasks:
             if t.group_id not in valid_ids:
                 t.group_id = fallback
@@ -143,10 +262,10 @@ class Store:
             for i, t in enumerate(items):
                 t.order = i
 
-    def save(self, force: bool = False) -> None:
-        """原子写入磁盘。"""
+    def save(self, force: bool = False) -> bool:
+        """原子写入磁盘；返回成功状态，失败时保留 dirty 供重试。"""
         if not self.dirty and not force:
-            return
+            return True
         payload = {
             "version": DATA_VERSION,
             "settings": self.data["settings"],
@@ -157,17 +276,25 @@ class Store:
             "focus_history": self.data["focus_history"],
             "total_focus": self.data["total_focus"],
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)   # 原子替换
             self.dirty = False
+            self.last_save_error = ""
+            return True
         except Exception as exc:  # noqa: BLE001
+            self.last_save_error = str(exc)
             self.log(f"保存失败：{exc}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     def log(self, message: str) -> None:
         """写一行日志（失败不影响主流程）。"""
@@ -394,6 +521,24 @@ class Store:
         self._normalize_orders()
         self.dirty = True
 
+    def restore_task(self, raw: Dict[str, Any]) -> Optional[Task]:
+        """恢复一条刚删除的任务；保留 ID、截止时间与原排序位次。"""
+        try:
+            task = Task.from_dict(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if self.task(task.id) is not None:
+            return None
+        if self.group(task.group_id) is None and self.groups:
+            task.group_id = self.groups[0].id
+        if task.done:
+            key = date_key(task.done_at)
+            self.data["history"][key] = int(self.data["history"].get(key, 0)) + 1
+            self.data["total_completed"] = int(self.data["total_completed"]) + 1
+        self.tasks.append(task)
+        self.dirty = True
+        return task
+
     def clear_completed(self) -> int:
         """清空已完成任务，返回删除条数（历史数据保留）。"""
         done = [t for t in self.tasks if t.done]
@@ -544,7 +689,8 @@ class Store:
 
     def export_json(self, path: Path) -> None:
         """导出完整数据备份。"""
-        self.save(force=True)
+        if not self.save(force=True):
+            raise OSError(f"无法先保存当前数据，未创建备份：{self.last_save_error}")
         shutil.copy2(self.path, path)
 
     def import_json(self, path: Path) -> int:
@@ -574,7 +720,8 @@ class Store:
         if version > DATA_VERSION:
             raise ValueError(f"备份来自更新版本（v{version}），请先升级拾光")
 
-        self.save(force=True)
+        if not self.save(force=True):
+            raise OSError(f"当前数据尚未保存，未执行恢复：{self.last_save_error}")
         stamp = time.strftime("%Y%m%d-%H%M%S")
         try:
             keep = self.path.with_name(f"data.pre-restore-{stamp}.json")
@@ -582,9 +729,18 @@ class Store:
             self.log(f"恢复前已保留当前数据：{keep.name}")
         except Exception:  # noqa: BLE001
             pass
-        shutil.copy2(path, self.path)
+        staged = self.path.with_suffix(".restore.tmp")
+        try:
+            shutil.copy2(path, staged)
+            os.replace(staged, self.path)
+        finally:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
         self.load()
         self.dirty = True
-        self.save(force=True)      # 版本号归一 + 落盘
+        if not self.save(force=True):  # 版本号归一 + 落盘
+            raise OSError(f"备份已载入，但整理后的数据未能保存：{self.last_save_error}")
         self.log(f"已从备份恢复 {len(self.tasks)} 条任务（version={version}）")
         return len(self.tasks)

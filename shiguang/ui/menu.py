@@ -42,6 +42,7 @@ from typing import Callable, List, Optional, Sequence, Union
 import customtkinter as ctk
 
 from .. import theme
+from .window_shape import schedule_rounded_region
 
 log = logging.getLogger("shiguang.menu")
 
@@ -53,28 +54,24 @@ _MEMORY_ADDR_RE = re.compile(
 )
 
 # ---- 尺寸常量（需求 11/12，集中管理，禁止在业务代码里硬编码）----
-MENU_WIDTH = 180          # 固定宽度，不再被最长项撑开
-ROW_HEIGHT = 34
-ICON_SIZE = 18
-ICON_TEXT_GAP = 8         # 图标与文字间距
-PAD_X = 12                # 左右内边距
-RADIUS = 12
-SEP_HEIGHT = 9            # 分隔线占位高
-MAX_LABEL_CHARS = 8       # 超长省略（需求 11）
-FADE_STEPS = 6            # 淡入帧数
-FADE_INTERVAL = 16        # ≈100ms
+MENU_WIDTH = theme.MENU_WIDTH          # 固定宽度，不再被最长项撑开
+ROW_HEIGHT = theme.MENU_ROW_HEIGHT
+ICON_SIZE = theme.MENU_ICON_SIZE
+ICON_TEXT_GAP = theme.MENU_ICON_TEXT_GAP         # 图标与文字间距
+PAD_X = theme.MENU_PAD_X                # 左右内边距
+RADIUS = theme.MENU_RADIUS
+SEP_HEIGHT = theme.MENU_SEP_HEIGHT            # 分隔线占位高
+MAX_LABEL_CHARS = theme.MENU_MAX_LABEL_CHARS       # 超长省略（需求 11）
+FADE_STEPS = theme.MENU_FADE_STEPS            # 淡入帧数
+FADE_INTERVAL = theme.MENU_FADE_INTERVAL        # ≈100ms
 
-# ---- 存活性（本轮修复"鼠标移过就消失"）----
-# 菜单**不靠焦点**判断生死。原来的做法是绑定 <FocusOut> → close()，
-# 而 hover 展开子菜单时子菜单会 focus_force()，父菜单立刻收到 FocusOut，
-# 于是父菜单 close() → 顺手把刚打开的子菜单一起 destroy()，表现为
-# "鼠标划过菜单，菜单连同子菜单瞬间消失"。现在改成纯指针判定：
-# 指针离开菜单树（含安全热区）并**连续 2 拍**都没回来才关。
-WATCH_INTERVAL = 120      # 轮询间隔 ms
-WATCH_MISS_LIMIT = 2      # 连续落空次数（≈240ms，够指针跨越子菜单与父菜单的接缝）
-SAFE_ZONE = 14            # 安全热区：指针在这个外扩范围内也算"还在菜单上"
-SUBMENU_DELAY = 140       # 悬停多久才展开子菜单（防手抖，也给"点开"留了余地）
-MOVE_TOLERANCE = 6        # 指针移动超过这个距离才算"用户动了手"（逻辑像素）
+# ---- 存活性 ----
+# 菜单不靠焦点判断生死：日期/确认窗口取得焦点时，菜单必须已主动关闭。
+# 其余时候按指针位置判断，连续 2 拍离开安全热区后收起。
+WATCH_INTERVAL = theme.MENU_WATCH_INTERVAL      # 轮询间隔 ms
+WATCH_MISS_LIMIT = theme.MENU_WATCH_MISS_LIMIT      # 连续落空次数（≈240ms，避免指针擦过菜单边缘即关闭）
+SAFE_ZONE = theme.MENU_SAFE_ZONE            # 安全热区：指针在这个外扩范围内也算"还在菜单上"
+MOVE_TOLERANCE = theme.MENU_MOVE_TOLERANCE        # 指针移动超过这个距离才算"用户动了手"（逻辑像素）
 
 # 当前唯一打开的顶层菜单。app.py 的 <Button-1> 用它做"点别处即收起"。
 _ACTIVE: List["ContextMenu"] = []
@@ -90,8 +87,6 @@ def close_active() -> None:
             pass
 
 # 选中项高亮底（需求 12：浅柔橘底）
-HOVER_LIGHT = "#FDF0E0"
-HOVER_DARK = "#463829"
 
 
 def clean_label(text, fallback: str = "") -> str:
@@ -145,6 +140,7 @@ class MenuRow:
     icon: object = None
     children: List["MenuRow"] = field(default_factory=list)
     disabled: bool = False
+    selected: bool = False
 
     @property
     def is_separator(self) -> bool:
@@ -204,15 +200,18 @@ class ContextMenu(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, rows: Sequence[MenuRow]) -> None:
         super().__init__(master)
+        self._app_window = (master._app_window if isinstance(master, ContextMenu)
+                            else master.winfo_toplevel())
         self.withdraw()
+        self.transient(self._app_window)
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", self._app_topmost())
         try:
             self.attributes("-alpha", 0.0)
         except Exception:  # noqa: BLE001
             pass
 
-        bg = theme.c("card")
+        bg = theme.c("window_border")
         self.configure(bg=bg)
 
         # ---- 逻辑 → 物理（一次性换算，后续只用物理值）----
@@ -225,16 +224,16 @@ class ContextMenu(tk.Toplevel):
         self.R = theme.lpx(RADIUS)
 
         self._rows = list(rows)
-        self._chain: List[tk.Toplevel] = []
+        # 子选项在同一张卡片内切换。窄窗口里两张并列浮窗会重叠，还会让子菜单
+        # 点击后把带 -topmost 的父菜单留在日期弹窗上方。
+        self._nav_stack: List[tuple] = []
+        self._back_row: Optional[MenuRow] = None
         self._hover_job: Optional[str] = None
         self._watch_job: Optional[str] = None
-        self._submenu_job: Optional[str] = None
         self._watch_miss = 0
         self._ever_inside = False
         self._open_pointer: Optional[tuple] = None
-        self._open_submenu_row: Optional[MenuRow] = None
         self._closing = False
-        self._is_submenu = False
 
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
                                 width=self.W)
@@ -245,6 +244,12 @@ class ContextMenu(tk.Toplevel):
         self._draw_background()
         self._bind_events()
 
+    def _app_topmost(self) -> bool:
+        try:
+            return bool(self._app_window.store.settings.get("always_on_top", False))
+        except Exception:  # noqa: BLE001
+            return False
+
     # ------------------------------------------------------------------
     def _layout(self) -> int:
         """按行类型累计高度，不做任何自适应 —— 高度必须完全可控。"""
@@ -254,24 +259,17 @@ class ContextMenu(tk.Toplevel):
         return max(self.ROW_H, h)
 
     def _draw_background(self) -> None:
-        """圆角背景：tkinter 没有真正的圆角窗口，用四角小圆补出柔角。
-
-        外圈画一个略深一点的描边色，制造"柔和投影"的观感（用颜色而非真阴影，
-        因为 Toplevel 无法只给卡片加阴影）。
-        """
+        """整块抗锯齿圆角图统一绘制四边和四角。"""
         import shiguang.ui.widgets as widgets
+        from PIL import ImageTk
 
-        border = theme.c("border")
+        border = theme.c("window_border")
         bg = theme.c("card")
-        r = self.R
-        # 全部用物理像素（self.W / self._height 均已换算）
-        # 外描边（打 menubg 标签：悬停高亮要靠它把自己夹到"菜单底之上、
-        # 行内容之下"，见 _on_motion）
-        widgets.round_rect(self.canvas, 0, 0, self.W, self._height, r,
-                           fill=border, outline="", tags="menubg")
-        # 内填充（留 1px 边）
-        widgets.round_rect(self.canvas, 1, 1, self.W - 1, self._height - 1, r - 1,
-                           fill=bg, outline="", tags="menubg")
+        self._background_photo = ImageTk.PhotoImage(widgets.aa_round_rect(
+            (self.W, self._height), self.R, bg,
+            border=border, border_w=theme.lpx(1)))
+        self.canvas.create_image(0, 0, anchor="nw", image=self._background_photo,
+                                 tags="menubg")
 
         y = 0
         for r_ in self._rows:
@@ -286,7 +284,14 @@ class ContextMenu(tk.Toplevel):
             y += self.ROW_H
 
     def _draw_row(self, r: MenuRow, y: int) -> None:
-        color = theme.c("text_muted") if r.disabled else theme.c("text")
+        if r.selected:
+            import shiguang.ui.widgets as widgets
+
+            widgets.round_rect(self.canvas, theme.lpx(5), y + theme.lpx(2),
+                               self.W - theme.lpx(5),
+                               y + self.ROW_H - theme.lpx(2), theme.lpx(8),
+                               fill=theme.c("accent_faint"), outline="")
+        color = theme.c("text_muted") if r.disabled and not r.selected else theme.c("text")
         x = self.PAD
 
         if r.icon is not None:
@@ -296,14 +301,21 @@ class ContextMenu(tk.Toplevel):
         label = clean_label(r.label, fallback="（无标题）")
         self.canvas.create_text(
             x, y + self.ROW_H / 2, text=label, anchor="w",
-            fill=color, font=theme.font("body"),
+            fill=color, font=theme.tkfont_spec("body"),
         )
+
+        if r.selected:
+            self.canvas.create_text(
+                self.W - self.PAD, y + self.ROW_H / 2, text="✓",
+                anchor="e", fill=theme.c("orange"),
+                font=theme.tkfont_spec("small_bold"),
+            )
 
         if r.is_submenu:
             chevron = "›"
             self.canvas.create_text(
                 self.W - self.PAD, y + self.ROW_H / 2, text=chevron,
-                anchor="e", fill=theme.c("text_muted"), font=theme.font("small"),
+                anchor="e", fill=theme.c("text_muted"), font=theme.tkfont_spec("small"),
             )
 
     def _draw_icon(self, icon, x: float, y: float) -> None:
@@ -311,7 +323,7 @@ class ContextMenu(tk.Toplevel):
         if isinstance(icon, str):
             self.canvas.create_text(x + self.ICON / 2, y + self.ICON / 2,
                                     text=icon, fill=theme.c("text_muted"),
-                                    font=theme.font("small"))
+                                    font=theme.tkfont_spec("small"))
         else:
             try:
                 self.canvas.create_image(x, y, image=icon, anchor="nw")
@@ -320,19 +332,14 @@ class ContextMenu(tk.Toplevel):
 
     # ------------------------------------------------------------------
     def _bind_events(self) -> None:
-        """事件绑定。
-
-        ⚠️ 这里**故意不绑 <FocusOut>**。菜单是独立的 overrideredirect 顶层窗口，
-        一旦用焦点判生死，展开子菜单（子菜单是另一个顶层窗口）就会把父菜单
-        判死 —— 连子菜单一起销毁。存活性统一交给 :meth:`_watch` 按指针位置判定。
-        """
-        self.bind("<Escape>", lambda _e: self.close())
+        """事件绑定；焦点切换不负责关闭菜单，指针看门狗负责。"""
+        self.bind("<Escape>", lambda _e: self._on_escape())
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Leave>", lambda _e: self._clear_hover())
 
     # ------------------------------------------------------------------
-    # 存活性：指针离开菜单树才关（含安全热区 + 连续两拍确认）
+    # 存活性：指针离开菜单才关（含安全热区 + 连续两拍确认）
     # ------------------------------------------------------------------
     def _watch(self) -> None:
         self._watch_job = None
@@ -368,7 +375,7 @@ class ContextMenu(tk.Toplevel):
         return abs(px - ox) > tol or abs(py - oy) > tol
 
     def _pointer_inside(self) -> bool:
-        """指针是否还在「本菜单 + 它的整条子菜单链」上（外扩安全热区）。
+        """指针是否仍在这张菜单卡片附近（外扩安全热区）。
 
         拿不到指针位置时保守返回 True —— 宁可菜单多留一会儿，也不要让它
         莫名其妙自己消失（用户会觉得"点不中"）。
@@ -378,17 +385,12 @@ class ContextMenu(tk.Toplevel):
         except Exception:  # noqa: BLE001
             return True
         zone = theme.lpx(SAFE_ZONE)
-        for win in [self] + list(self._chain):
-            try:
-                if not win.winfo_exists():
-                    continue
-                x, y = win.winfo_rootx(), win.winfo_rooty()
-                if (x - zone <= px <= x + win.winfo_width() + zone
-                        and y - zone <= py <= y + win.winfo_height() + zone):
-                    return True
-            except Exception:  # noqa: BLE001
-                continue
-        return False
+        try:
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            return (x - zone <= px <= x + self.winfo_width() + zone
+                    and y - zone <= py <= y + self.winfo_height() + zone)
+        except Exception:  # noqa: BLE001
+            return True
 
     def _row_at(self, y: int) -> Optional[tuple]:
         """返回 (row, y_top)，跳过分隔线。"""
@@ -408,13 +410,15 @@ class ContextMenu(tk.Toplevel):
         if hit is None:
             return
         r, y_top = hit
+        if r.disabled:
+            return
         # 悬停项：浅柔橘底 + 圆角，右侧留 6px 不贴边
         import shiguang.ui.widgets as widgets
 
         widgets.round_rect(self.canvas, theme.lpx(6), y_top + theme.lpx(2),
                            self.W - theme.lpx(6),
                            y_top + self.ROW_H - theme.lpx(2), theme.lpx(8),
-                           fill=HOVER_DARK if theme.is_dark() else HOVER_LIGHT,
+                           fill=theme.c("menu_hover"),
                            outline="", tags="hover")
         # 层序必须是：**菜单底 → 悬停高亮 → 行内容**。
         # 只把高亮 ``tag_lower("hover")`` 的话，它会一路沉到菜单底色
@@ -424,15 +428,8 @@ class ContextMenu(tk.Toplevel):
         self.canvas.tag_lower("hover")
         self.canvas.tag_lower("menubg")
 
-        if r.is_submenu and not r.disabled:
-            # 同一个子菜单项上继续移动鼠标，不要重建（重建 = 闪烁 + 指针追不上）
-            if self._open_submenu_row is r:
-                return
-            self._schedule_submenu(r, y_top)
-        else:
-            # 停在普通项上：说明不是"要去子菜单"，立即收起
-            self._cancel_submenu_job()
-            self._close_submenus()
+        # 点击带箭头的行才进入子选项。悬停时替换整张卡片会让菜单在指针下
+        # 突然变形，用户反而容易误点；这里只给明确的高亮反馈。
 
     def _clear_hover(self) -> None:
         self.canvas.delete("hover")
@@ -444,106 +441,75 @@ class ContextMenu(tk.Toplevel):
         r, y_top = hit
         if r.disabled:
             return
+        if r is self._back_row:
+            self._go_back()
+            return
         if r.is_submenu:
-            # 需求 ④"改为点击触发"：点带子菜单的项也能直接展开，
-            # 不必依赖"悬停对了位置"这件事
-            self._cancel_submenu_job()
             self._open_submenu(r, y_top)
             return
+        action = r.action
+        app_window = self._app_window
         self.close()
-        if r.action is not None:
-            r.action()
+        if action is not None:
+            # 菜单销毁要先跨过一轮窗口事件，之后再开日期/确认等模态窗口。
+            # 否则 Windows 会把新弹窗排到刚关闭的菜单或主窗口之后。
+            try:
+                app_window.after(25, action)
+            except Exception:  # noqa: BLE001
+                action()
 
     # ------------------------------------------------------------------
-    def _schedule_submenu(self, r: MenuRow, y_top: int) -> None:
-        """延迟展开子菜单（悬停触发用）。"""
-        self._cancel_submenu_job()
-        self._submenu_job = self.after(
-            SUBMENU_DELAY, lambda: self._open_submenu(r, y_top))
-
-    def _cancel_submenu_job(self) -> None:
-        if self._submenu_job is not None:
-            try:
-                self.after_cancel(self._submenu_job)
-            except Exception:  # noqa: BLE001
-                pass
-            self._submenu_job = None
+    def _on_escape(self) -> None:
+        if self._nav_stack:
+            self._go_back()
+        else:
+            self.close()
 
     def _open_submenu(self, r: MenuRow, y_top: int) -> None:
-        self._submenu_job = None
-        if self._open_submenu_row is r and self._chain:
-            return                        # 已经是它，别重建（重建会让指针"追不上"）
-        self._close_submenus()
-        sub = ContextMenu._build_sub(self, r.children)
-        if sub is None:
+        """在同一张卡片内显示子选项，保留明确的返回入口。"""
+        if not r.children:
             return
-        self._open_submenu_row = r
-        self._chain.append(sub)
-        # watch=False：存活性由顶层菜单统管，子菜单跟着父菜单一起走
-        sub.show_at(self.winfo_rootx() + self.W - theme.lpx(6),
-                    self.winfo_rooty() + y_top + 2, watch=False)
+        old_x, old_y = self.winfo_rootx(), self.winfo_rooty()
+        self._nav_stack.append((self._rows, self._back_row, old_x, old_y))
+        self._back_row = MenuRow(label=f"‹ {r.label}")
+        self._replace_rows([self._back_row, separator(), *r.children],
+                           old_x, old_y + y_top)
 
-    def _close_submenus(self) -> None:
-        self._open_submenu_row = None
-        for w in self._chain:
-            try:
-                w.destroy()
-            except Exception:  # noqa: BLE001
-                pass
-        self._chain.clear()
+    def _go_back(self) -> None:
+        if not self._nav_stack:
+            self.close()
+            return
+        rows, back_row, x, y = self._nav_stack.pop()
+        self._back_row = back_row
+        self._replace_rows(rows, x, y)
 
-    @classmethod
-    def _build_sub(cls, master: tk.Misc, children: Sequence[MenuRow]) -> Optional["ContextMenu"]:
-        rows = [c for c in children if c is not None]
-        if not rows:
-            return None
-        menu = cls.__new__(cls)
-        tk.Toplevel.__init__(menu, master)
-        menu.withdraw()
-        menu.overrideredirect(True)
+    def _replace_rows(self, rows: Sequence[MenuRow], x: int, y: int) -> None:
+        self._rows = list(rows)
+        self._height = self._layout()
+        self.canvas.configure(height=self._height)
+        self.canvas.delete("all")
+        self._draw_background()
+        margin = theme.lpx(4)
         try:
-            menu.attributes("-topmost", True)
+            owner = self._app_window
+            ox, oy = owner.winfo_rootx(), owner.winfo_rooty()
+            ow, oh = owner.winfo_width(), owner.winfo_height()
+            x = max(ox + margin, min(x, ox + ow - self.W - margin))
+            y = max(oy + margin, min(y, oy + oh - self._height - margin))
         except Exception:  # noqa: BLE001
             pass
-        bg = theme.c("card")
-        menu.configure(bg=bg)
-        # 子菜单走 __new__ 手工初始化，绕过了 __init__，所以这组物理尺寸
-        # 必须在这里再算一次（否则子菜单会退回逻辑像素，宽度只有一半）。
-        menu.W = theme.lpx(MENU_WIDTH)
-        menu.ROW_H = theme.lpx(ROW_HEIGHT)
-        menu.SEP_H = theme.lpx(SEP_HEIGHT)
-        menu.ICON = theme.lpx(ICON_SIZE)
-        menu.ICON_GAP = theme.lpx(ICON_TEXT_GAP)
-        menu.PAD = theme.lpx(PAD_X)
-        menu.R = theme.lpx(RADIUS)
-        menu._rows = rows
-        menu._chain = []
-        menu._hover_job = None
-        menu._watch_job = None
-        menu._submenu_job = None
-        menu._watch_miss = 0
-        menu._ever_inside = False
-        menu._open_pointer = None
-        menu._open_submenu_row = None
-        menu._closing = False
-        menu._is_submenu = True
-        menu.canvas = tk.Canvas(menu, bg=bg, highlightthickness=0, bd=0,
-                                width=menu.W)
-        menu.canvas.pack(fill="both", expand=True)
-        menu._height = menu._layout()
-        menu.canvas.configure(height=menu._height)
-        menu._draw_background()
-        menu._bind_events()
-        return menu
+        self.geometry(f"{self.W}x{self._height}+{int(x)}+{int(y)}")
+        schedule_rounded_region(self, self.R)
+        self._watch_miss = 0
+        self._ever_inside = False
 
     # ------------------------------------------------------------------
-    def show_at(self, x: int, y: int, watch: bool = True) -> None:
+    def show_at(self, x: int, y: int) -> None:
         """在屏幕坐标 (x, y) 弹出，并自动避开屏幕右/下边缘。
 
         ``x``/``y`` 必须是**物理像素**（``winfo_pointerx()``、
         ``winfo_rootx()`` 返回的都是物理值）；``geometry()`` 也按物理像素解释。
 
-        ``watch=False`` 给子菜单用：存活性由顶层菜单统一看守。
         """
         self.update_idletasks()
         w, h = self.W, self._height
@@ -564,25 +530,33 @@ class ContextMenu(tk.Toplevel):
         margin = theme.lpx(4)
         x = max(vx, min(x, sw - w - margin))
         y = max(vy, min(y, sh - h - margin))
+        # 菜单必须留在所属应用客户区内。仅按显示器边缘钳制时，靠近应用底部
+        # 的分组菜单会伸到窗口外，和应用边框形成断裂的视觉层次。
+        try:
+            owner = self._app_window
+            ox, oy = owner.winfo_rootx(), owner.winfo_rooty()
+            ow, oh = owner.winfo_width(), owner.winfo_height()
+            if w <= ow - margin * 2 and h <= oh - margin * 2:
+                x = max(ox + margin, min(x, ox + ow - w - margin))
+                y = max(oy + margin, min(y, oy + oh - h - margin))
+        except Exception:  # noqa: BLE001
+            pass
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.deiconify()
-        self.attributes("-topmost", True)
-        if watch:
-            _ACTIVE.append(self)
-            try:
-                self._open_pointer = self.winfo_pointerxy()
-            except Exception:  # noqa: BLE001
-                self._open_pointer = None
-            self._watch()
+        schedule_rounded_region(self, self.R)
+        self.attributes("-topmost", self._app_topmost())
+        self.lift()
+        _ACTIVE.append(self)
+        try:
+            self._open_pointer = self.winfo_pointerxy()
+        except Exception:  # noqa: BLE001
+            self._open_pointer = None
+        self._watch()
         self._fade_in()
-        if watch:
-            # 只有顶层菜单抢焦点：这样 Esc 立刻生效，而且菜单一出现就能
-            # 用键盘操作。子菜单**绝不**抢焦点 —— 正是它当年抢焦点把
-            # 父菜单判成了"失焦"，才导致整条菜单链瞬间消失。
-            try:
-                self.focus_force()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            self.focus_force()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _fade_in(self) -> None:
         """淡入（tkinter 支持 Toplevel 的 -alpha）。"""
@@ -603,19 +577,19 @@ class ContextMenu(tk.Toplevel):
         if self._closing:
             return
         self._closing = True
-        for job in (self._hover_job, self._watch_job, self._submenu_job):
+        for job in (self._hover_job, self._watch_job):
             if job is not None:
                 try:
                     self.after_cancel(job)
                 except Exception:  # noqa: BLE001
                     pass
-        self._hover_job = self._watch_job = self._submenu_job = None
+        self._hover_job = self._watch_job = None
         try:
             if self in _ACTIVE:
                 _ACTIVE.remove(self)
         except Exception:  # noqa: BLE001
             pass
-        self._close_submenus()
+        self._nav_stack.clear()
         try:
             self.destroy()
         except Exception:  # noqa: BLE001

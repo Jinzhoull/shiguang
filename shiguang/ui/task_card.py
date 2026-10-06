@@ -21,23 +21,7 @@ import customtkinter as ctk
 from .. import strings, theme
 from ..models import Task
 from . import menu, widgets
-
-
-def _apply_color_key(tip: tk.Toplevel, key: str) -> bool:
-    """把 ``key`` 设成 ``tip`` 的**透明色键**（Windows 专有）。
-
-    置位后，窗口上所有像素颜色恰好等于 ``key`` 的地方会被系统整片抠掉
-    （同时穿透点击）—— 悬停提示四周那圈为了投影留下的方形留边就此消失。
-
-    ``-transparentcolor`` 是 Windows 才有的 wm 属性，其它平台会抛 TclError；
-    这里吞掉异常返回 False，调用方行为退回"底色 = 页面底色"（旧的观感），
-    不至于因为一个纯装饰属性把提示整个搞没。
-    """
-    try:
-        tip.attributes("-transparentcolor", key)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+from .window_shape import apply_rounded_region, attach_native_owner, schedule_rounded_region
 
 
 class TaskCard(ctk.CTkFrame):
@@ -72,16 +56,16 @@ class TaskCard(ctk.CTkFrame):
     ICON_SIZE = theme.TASK_ICON      # 右侧动作图标
     ICON_BTN = theme.TASK_ICON_BTN   # 图标按钮的点击热区（比图标大，好点）
     CHECK_SIZE = theme.TASK_CHECK    # 太阳勾选框直径（逻辑像素）
-    FADE_STEPS = 6            # 需求 26：150ms 淡入（6 × 25ms）
-    FADE_INTERVAL = 25
-    TITLE_MIN_WRAP = 72       # 窗口缩到最小时标题的折行下限（逻辑像素）
+    FADE_STEPS = theme.TASK_FADE_STEPS            # 需求 26：150ms 淡入（6 × 25ms）
+    FADE_INTERVAL = theme.TASK_FADE_INTERVAL
+    TITLE_MIN_WRAP = theme.TASK_TITLE_MIN_WRAP       # 窗口缩到最小时标题的折行下限（逻辑像素）
     # 右侧动作区的**固定**宽度（1.5.15 起在实例上实测，见 _measure_actions）。
     # 为什么不能用静态常量：CTkButton 带 image 时有内部宽度下限（实测约
     # 36.7 逻辑像素/个，远大于 ICON_BTN=20 的"请求值"），旧常量
     # ICON_BTN*3+6=66 严重低估真实宽 114 —— 标题截断按 66 预留，悬停时
     # 图标一浮出来就压住标题/日期（1.5.13 没修干净的真因）。实例上用
     # winfo_reqwidth() 实测三个按钮的真实宽，预留永远等于实况。
-    ACTIONS_PAD_X = 4         # 动作容器与元信息块（徽章+时间）之间的间隙
+    ACTIONS_PAD_X = theme.TASK_ACTIONS_PAD_X         # 动作容器与元信息块（徽章+时间）之间的间隙
 
     def __init__(
         self,
@@ -659,19 +643,35 @@ class TaskCard(ctk.CTkFrame):
         """
         if os.environ.get("SHIGUANG_NO_HINT") == "1":
             return
+        # 计时状态每秒刷新。一个控件只绑定一组 Enter/Leave，更新文案即可；
+        # 重复绑定会累积回调，最终一次悬停弹出多个提示窗。
+        state = getattr(widget, "_shiguang_hint_state", None)
+        if state is not None:
+            if state["text"] != text:
+                state["hide"]()
+            state.update(text=text, gate=gate)
+            return
+        state = {"text": text, "gate": gate}
+        widget._shiguang_hint_state = state
         tip: Optional[tk.Toplevel] = None
         tip_photo = None                    # 位图引用（不持有会被 GC 掉，白框）
+        watch_job = None
 
         def show() -> None:
             nonlocal tip, tip_photo
             if tip is not None:             # 已经在显示，别叠第二层
                 return
-            if gate is not None and not gate():
+            current_gate = state["gate"]
+            if current_gate is not None and not current_gate():
                 return                      # 标题完整可见 —— 不弹
+            text = state["text"]
             try:
                 host = widget.winfo_toplevel()
+                if (not host.winfo_viewable()
+                        or not getattr(host, "is_foreground", lambda: True)()):
+                    return
                 host.update_idletasks()
-                edge = theme.lpx(6)
+                edge = theme.lpx(theme.TOOLTIP_EDGE_PAD)
                 host_x = host.winfo_rootx()
                 host_y = host.winfo_rooty()
                 host_w = max(1, host.winfo_width())
@@ -681,26 +681,42 @@ class TaskCard(ctk.CTkFrame):
                 tip = tk.Toplevel(self)
                 tip.wm_overrideredirect(True)
                 tip.withdraw()
-                tip.attributes("-topmost", True)
-                # 整块米白圆角卡（描边 + 文字一张 PIL 位图）；外沿透明，
-                # 不绘制投影框。字体层不可用时降级回无硬边的单色标签。
-                key = widgets.tooltip_key()
-                tip.configure(bg=key)
-                _apply_color_key(tip, key)
-                rendered = widgets.tooltip_image(text, max_width=max_tip_w)
+                tip.transient(host)
+                try:
+                    tip.attributes("-topmost", bool(
+                        host.store.settings.get("always_on_top", False)))
+                except Exception:  # noqa: BLE001
+                    tip.attributes("-topmost", False)
+                # 客户区与卡片精确等大，圆角由原生区域裁切，不留色键/投影边距。
+                border = theme.c("tooltip_border")
+                tip.configure(bg=border)
+                rendered = widgets.tooltip_image(text, max_width=max_tip_w,
+                                                  max_height=host_h - edge * 2)
                 if rendered is None:
-                    tk.Label(tip, text=text, bg=theme.c("tooltip_bg"),
-                             fg=theme.c("tooltip_text"),
-                             font=theme.tkfont_spec("tiny"),
-                             wraplength=max(1, max_tip_w - theme.lpx(16)),
-                             padx=theme.lpx(8), pady=theme.lpx(3),
-                             bd=0).pack()
+                    canvas = tk.Canvas(tip, bg=border, bd=0, highlightthickness=0)
+                    pad_x, pad_y = theme.lpx(theme.TOOLTIP_PAD_X), theme.lpx(theme.TOOLTIP_PAD_Y)
+                    item = canvas.create_text(pad_x, pad_y, text=text, anchor="nw",
+                                              width=max(1, max_tip_w - pad_x * 2),
+                                              fill=theme.c("tooltip_text"),
+                                              font=theme.tkfont_spec("tiny"))
+                    box = canvas.bbox(item)
+                    bw, bh = box[2] + pad_x, box[3] + pad_y
+                    canvas.configure(width=bw, height=bh)
+                    radius = theme.lpx(theme.TOOLTIP_RADIUS)
+                    line = max(1, theme.lpx(theme.TOOLTIP_BORDER_W))
+                    widgets.round_rect(canvas, 0, 0, bw, bh, radius,
+                                       fill=border, outline="")
+                    widgets.round_rect(canvas, line, line, bw - line, bh - line,
+                                       max(0, radius - line),
+                                       fill=theme.c("tooltip_bg"), outline="")
+                    canvas.tag_raise(item)
+                    canvas.pack()
                 else:
                     from PIL import ImageTk
 
                     img, (bw, bh) = rendered
                     canvas = tk.Canvas(tip, width=bw, height=bh,
-                                       bg=key,
+                                       bg=border,
                                        highlightthickness=0, bd=0)
                     canvas.pack()
                     tip_photo = ImageTk.PhotoImage(img)
@@ -721,14 +737,39 @@ class TaskCard(ctk.CTkFrame):
                     y = widget.winfo_rooty() - tip_h - edge
                 y = min(y, bottom - tip_h)
                 y = max(top, y)
-                tip.geometry(f"+{x}+{y}")
+                tip.geometry(f"{tip_w}x{tip_h}+{x}+{y}")
+                apply_rounded_region(tip, theme.lpx(theme.TOOLTIP_RADIUS),
+                                     size=(tip_w, tip_h))
                 tip.deiconify()
+                attach_native_owner(tip, host)
+                schedule_rounded_region(tip, theme.lpx(theme.TOOLTIP_RADIUS))
+                watch()
             except Exception:  # noqa: BLE001
-                tip = None
-                tip_photo = None
+                hide()
+
+        def watch() -> None:
+            nonlocal watch_job
+            watch_job = None
+            if tip is None:
+                return
+            try:
+                host = widget.winfo_toplevel()
+                if (not widget.winfo_viewable()
+                        or not getattr(host, "is_foreground", lambda: True)()):
+                    hide()
+                    return
+                watch_job = self.after(theme.FLOAT_WATCH_MS, watch)
+            except tk.TclError:
+                hide()
 
         def hide() -> None:
-            nonlocal tip, tip_photo
+            nonlocal tip, tip_photo, watch_job
+            if watch_job:
+                try:
+                    self.after_cancel(watch_job)
+                except tk.TclError:
+                    pass
+                watch_job = None
             if tip is not None:
                 try:
                     tip.destroy()
@@ -739,6 +780,8 @@ class TaskCard(ctk.CTkFrame):
 
         widget.bind("<Enter>", lambda _e: show(), add="+")
         widget.bind("<Leave>", lambda _e: hide(), add="+")
+        widget.bind("<Button-1>", lambda _e: hide(), add="+")
+        state["hide"] = hide
 
     # ------------------------------------------------------------------
     # 截止日期呈现
@@ -956,8 +999,8 @@ class TaskCard(ctk.CTkFrame):
         """
         self._cancel_settle()
         done = bool(self.task.done)
-        light_to = theme.LIGHT.get("card_done" if done else "card", "#FFFFFF")
-        dark_to = theme.DARK.get("card_done" if done else "card", "#2D2A26")
+        light_to = theme.LIGHT.get("card_done" if done else "card", theme.c("on_nav"))
+        dark_to = theme.DARK.get("card_done" if done else "card", theme.DARK["bg"])
         light_from = theme.LIGHT.get(theme.TASK_SETTLE_COLOR, light_to)
         dark_from = theme.DARK.get(theme.TASK_SETTLE_COLOR, dark_to)
         dark_mode = theme.is_dark()
@@ -999,22 +1042,19 @@ class TaskCard(ctk.CTkFrame):
         move_items = []
         for grp in self.dispatch("groups", None):
             is_current = grp.id == self.task.group_id
+            try:
+                icon_key = self.winfo_toplevel().store.group_icon(grp.id)
+            except Exception:  # noqa: BLE001
+                icon_key = grp.icon if isinstance(grp.icon, str) else ""
             move_items.append(
                 menu.MenuRow(
                     label=menu.ellipsize(str(grp.name), 10),
                     action=None if is_current else (
                         lambda gid=grp.id: self.dispatch("move", (self.task.id, gid))),
+                    icon=self._icon(icon_key),
                     disabled=is_current,
+                    selected=is_current,
                 )
-            )
-
-        due_children = [
-            menu.row("设置截止日期…", lambda: self.dispatch("due", self.task.id),
-                     icon=self._icon("calendar")),
-        ]
-        if self.task.due_date is not None:
-            due_children.append(
-                menu.row("清除截止日期", lambda: self.dispatch("clear_due", self.task.id))
             )
 
         rows = [
@@ -1027,7 +1067,8 @@ class TaskCard(ctk.CTkFrame):
             menu.row("标记未完成" if self.task.done else "标记完成",
                      lambda: self.dispatch("toggle", (self.task.id, not self.task.done)),
                      icon=self._icon("check")),
-            menu.submenu("设置截止日期", due_children, icon=self._icon("calendar")),
+            menu.row("设置截止日期", lambda: self.dispatch("due", self.task.id),
+                     icon=self._icon("calendar")),
             menu.submenu("移动到分组", move_items, icon=self._icon("move")),
             menu.separator(),
             menu.row("删除任务", lambda: self.dispatch("delete", self.task.id),
@@ -1069,11 +1110,13 @@ class GroupCard(ctk.CTkFrame):
         tasks,
         render_task: Callable,
         dispatch: Callable[[str, Any], None],
+        visible_task_ids: Optional[set[str]] = None,
     ) -> None:
         super().__init__(master, corner_radius=theme.RADIUS_CARD, fg_color="transparent")
         self.app = app
         self.group = group
         self.dispatch = dispatch
+        self._visible_task_ids = visible_task_ids
         self.cards: list[TaskCard] = []
         self._photo = None
         self._empty_hint = None
@@ -1261,6 +1304,8 @@ class GroupCard(ctk.CTkFrame):
     def update_count(self) -> None:
         """刷新标题栏的完成计数（如 2/5）。"""
         tasks = self.app.store.tasks_in(self.group.id)
+        if self._visible_task_ids is not None:
+            tasks = [task for task in tasks if task.id in self._visible_task_ids]
         done = sum(1 for t in tasks if t.done)
         self.count_label.configure(text=f"{done}/{len(tasks)}")
 

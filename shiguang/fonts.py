@@ -45,6 +45,7 @@ from typing import Dict, List, Optional, Tuple
 import customtkinter as ctk
 
 _LOG = logging.getLogger("shiguang.fonts")
+FALLBACK_FONT_FILE = "msyh.ttc"
 
 # --------------------------------------------------------------------------
 # 字体栈

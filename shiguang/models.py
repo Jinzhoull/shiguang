@@ -293,6 +293,25 @@ class Task:
         return self.remind_offset is not None and self.due_date is not None
 
 
+def task_matches_filter(task: "Task", query: str = "", filter_key: str = "all",
+                        today: Optional[_dt.date] = None) -> bool:
+    """纯任务筛选规则，供任务页和数据层自检共用。"""
+    normalized = (query or "").strip().casefold()
+    if normalized and normalized not in (task.title + " " + task.note).casefold():
+        return False
+    current_day = today or _dt.date.today()
+    if filter_key == "today":
+        return (not task.done and task.due_date is not None
+                and task.due_date.date() == current_day)
+    if filter_key == "overdue":
+        return task.is_overdue
+    if filter_key == "open":
+        return not task.done
+    if filter_key == "done":
+        return task.done
+    return True
+
+
 @dataclass
 class Group:
     """任务分组。"""

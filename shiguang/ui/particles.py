@@ -1,25 +1,8 @@
 # -*- coding: utf-8 -*-
-"""粒子动画：任务全部完成时的暖金粒子迸发。
+"""暖金粒子动画：原生窗口区域只包含活跃粒子的圆形。
 
-为什么用"透明色键 Toplevel"而不是盖在窗口上的 Canvas（这是第一版踩的坑）
---------------------------------------------------------------------
-tkinter 的控件**没有 alpha 通道**。第一版在主窗口上 ``place`` 了一个铺满的 Canvas，
-它的不透明底色 ``#FAF7F2`` 直接把整个界面糊住了 —— 动画的 1.5 秒里用户完全看不到
-任务卡片，截图回来只有一片底色加几个小点。这个方案从根上不成立。
-
-Windows 支持给窗口设**透明色键**（``-transparentcolor``）：把一个魔法色声明为
-全透明。于是做法变成：无边框置顶小窗口 + 魔法色底 + 上面画粒子，
-粒子浮在界面之上，其余区域完全透明。这才是"浮层粒子"在 tkinter 里唯一干净的实现。
-
-其余三个关键设计
-----------------
-1. **对象池**：一次性建好 ``MAX_PARTICLES`` 个 oval item，之后每次播放只改
-   ``coords`` / ``fill``，绝不 ``create_oval`` / ``delete``。连点十几次也不会掉帧。
-2. **时间驱动而非帧计数**：每帧按真实经过的毫秒算位置，某帧迟到也不会让轨迹跳变。
-3. **淡出用"收缩 + 降色温"**：没有 alpha 就不能向背景插值（背景是透明的，
-   插值会露出色块），改成半径收缩到 0 + 颜色向浅金靠拢，观感是火花自然熄灭。
-
-窗口不可见（最小化到托盘）时动画自行中止 —— 在看不见的窗口上跑 90 帧纯属白烧 CPU。
+每帧复用 Canvas 的粒子对象，并把窗口裁切为这些圆形的并集。
+不使用颜色键、投影或整块不透明覆盖层；切走应用即停止动画。
 """
 
 from __future__ import annotations
@@ -32,15 +15,16 @@ import tkinter as tk
 from typing import List, Optional
 
 from .. import theme
+from .window_shape import apply_particle_region, attach_native_owner
 
 log = logging.getLogger("shiguang.particles")
 
 # 品牌暖色系：金色 / 柔橘 / 暖黄 / 浅金
-PARTICLE_COLORS = ["#E8B84A", "#E89A4A", "#F5D76E", "#FCEABB"]
+PARTICLE_COLOR_KEYS = ("accent", "orange", "particle_spark", "particle_fade")
 
-MAX_PARTICLES = 30
-FRAME_MS = 16                  # ≈60fps，一帧工作量远低于 16ms 的预算
-DURATION_MS = 1500             # 粒子总时长，配合文案控制在 2 秒内
+MAX_PARTICLES = theme.PARTICLE_MAX
+FRAME_MS = theme.PARTICLE_FRAME_MS                  # ≈60fps，一帧工作量远低于 16ms 的预算
+DURATION_MS = theme.PARTICLE_DURATION_MS             # 粒子总时长，配合文案控制在 2 秒内
 
 
 class _Particle:
@@ -51,7 +35,7 @@ class _Particle:
     def __init__(self) -> None:
         self.x = self.y = 0.0
         self.vx = self.vy = 0.0
-        self.color = PARTICLE_COLORS[0]
+        self.color = theme.c(PARTICLE_COLOR_KEYS[0])
         self.radius = 2.0
         self.alive = False
         self.delay = 0.0       # 错峰起飞，避免所有粒子糊成一团
@@ -59,9 +43,6 @@ class _Particle:
 
 class ParticleLayer:
     """粒子迸发层（透明置顶浮窗，可反复播放）。"""
-
-    # 魔法色：粒子配色里绝不能出现它，否则那部分会被"抠掉"
-    KEY_COLOR = "#FF00FF"
 
     def __init__(self, master: tk.Misc) -> None:
         self.master = master
@@ -97,11 +78,13 @@ class ParticleLayer:
             win = tk.Toplevel(self.master)
             win.withdraw()                       # 先藏起来，避免创建时闪一下
             win.overrideredirect(True)           # 去掉标题栏/边框，也不进任务栏
-            win.configure(bg=self.KEY_COLOR)
-            win.attributes("-topmost", True)
-            # 关键一步：把魔法色声明为全透明。非 Windows 平台会抛 TclError
-            win.attributes("-transparentcolor", self.KEY_COLOR)
-            canvas = tk.Canvas(win, bg=self.KEY_COLOR,
+            win.configure(bg=theme.c("accent"))
+            win.transient(self.master.winfo_toplevel())
+            if not apply_particle_region(win, []):
+                win.destroy()
+                self._supported = False
+                return False
+            canvas = tk.Canvas(win, bg=theme.c("accent"),
                                highlightthickness=0, bd=0)
             canvas.pack(fill="both", expand=True)
             self._win, self._canvas = win, canvas
@@ -163,9 +146,12 @@ class ParticleLayer:
         try:
             # DPI 感知进程里 winfo_* 返回的就是物理像素，直接喂给 geometry 即可对齐
             self._win.geometry(f"{host_w}x{host_h}+{root_x}+{root_y}")
+            apply_particle_region(self._win, [])
             self._win.deiconify()
-            self._win.attributes("-topmost", True)
             self._win.update_idletasks()
+            attach_native_owner(self._win, master)
+            self._win.attributes("-topmost", bool(getattr(master, "store", None) and
+                                 master.store.settings.get("always_on_top", False)))
         except Exception as exc:  # noqa: BLE001
             log.info("粒子浮层定位失败：%s", exc)
             return False
@@ -191,7 +177,7 @@ class ParticleLayer:
             p.x, p.y = cx, cy
             p.vx = math.cos(angle) * speed
             p.vy = math.sin(angle) * speed - 60.0      # 略微向上，更像"迸发"
-            p.color = random.choice(PARTICLE_COLORS)
+            p.color = theme.c(random.choice(PARTICLE_COLOR_KEYS))
             p.radius = random.uniform(1.8, 3.6)
             p.delay = random.uniform(0.0, 0.12)
             p.alive = True
@@ -220,7 +206,8 @@ class ParticleLayer:
                 self.stop()
                 return
             # 主窗口被藏起来（最小化到托盘）就放弃这一轮，不空转
-            if not self.master.winfo_viewable():
+            if (not self.master.winfo_viewable()
+                    or not getattr(self.master, "is_foreground", lambda: True)()):
                 self.stop()
                 return
         except Exception:  # noqa: BLE001
@@ -238,6 +225,7 @@ class ParticleLayer:
         gravity = 460.0
         damping = 0.62
 
+        bounds = []
         for i, p in enumerate(self._pool):
             item = self._items[i]
             if not p.alive:
@@ -254,17 +242,21 @@ class ParticleLayer:
             # "淡出"：半径收缩 + 色温向浅金靠拢（没有 alpha 就用这两招模拟熄灭）
             life = max(0.0, min(1.0, (local * 1000.0) / (DURATION_MS * 0.85)))
             r = p.radius * max(0.0, 1.0 - life * life)
-            color = theme.mix(p.color, "#FCEABB", min(1.0, life * 0.7))
+            color = theme.mix(p.color, theme.c("particle_fade"), min(1.0, life * 0.7))
 
             try:
                 if r < 0.25:
                     self._canvas.itemconfigure(item, fill="")
                 else:
+                    bounds.append((x - r, y - r, x + r, y + r))
                     self._canvas.coords(item, x - r, y - r, x + r, y + r)
                     self._canvas.itemconfigure(item, fill=color, outline="")
             except Exception:  # noqa: BLE001
                 p.alive = False
 
+        if not apply_particle_region(self._win, bounds):
+            self.stop()
+            return
         self._job = self.master.after(FRAME_MS, self._step)
 
     # ------------------------------------------------------------------

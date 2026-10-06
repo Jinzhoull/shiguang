@@ -15,8 +15,8 @@
 这样既满足"后台每 60 秒检查一次"，又保证数据只在主线程被访问 —— 和托盘/热键
 回调走的是同一套线程安全约定，不会引入第二套并发模型。
 
-去重规则：每个任务只提醒一次。已提醒的 task_id 存在内存 Set 里
-（不落盘 —— 重启后重新提醒一次是合理行为，也避免配置文件被塞满历史 ID）。
+去重规则：每个任务在每次运行中只提醒一次；用户主动推迟后，在推迟时间到达时再提醒。
+已提醒与推迟记录保存在内存中，应用重启后仍会重新检查符合条件的任务。
 
 提醒与否由**任务自己的** ``remind_offset`` 决定（1.5.3 新增）：
 ``None`` = 不提醒（轮询跳过该任务）、``0`` = 准时提醒、``n`` = 提前 n 分钟。
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import stats
@@ -49,6 +50,7 @@ class ReminderService:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self.reminded: Set[str] = set()      # 已提醒过的 task_id
+        self._snoozed_until: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 后台线程
@@ -117,7 +119,12 @@ class ReminderService:
         by_id: Dict[str, Task] = {t.id: t for t in candidates}
 
         out: List[Tuple[str, Task]] = []
+        now = time.monotonic()
         for task_id in pending:
+            snoozed_until = self._snoozed_until.get(task_id, 0.0)
+            if snoozed_until > now:
+                continue
+            self._snoozed_until.pop(task_id, None)
             task = by_id.get(task_id)
             if task is None:
                 continue
@@ -133,9 +140,24 @@ class ReminderService:
         否则同一任务改过时间后不会再收到提醒 —— 这是很容易漏掉的一环。
         """
         self.reminded.discard(task_id)
+        self._snoozed_until.pop(task_id, None)
+
+    def snooze(self, task_id: str, minutes: int = 10) -> bool:
+        """把一条可提醒任务推迟一段时间；到时允许它再次提醒。"""
+        task = self.store.task(task_id)
+        if task is None or not task.remind_enabled:
+            return False
+        try:
+            delay = max(1, min(24 * 60, int(minutes)))
+        except (TypeError, ValueError, OverflowError):
+            delay = 10
+        self.reminded.discard(task_id)
+        self._snoozed_until[task_id] = time.monotonic() + delay * 60
+        return True
 
     def reset(self) -> None:
         self.reminded.clear()
+        self._snoozed_until.clear()
 
     # ------------------------------------------------------------------
     @staticmethod

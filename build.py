@@ -185,7 +185,7 @@ def main() -> int:
         if exe.exists():
             print(f"  主程序 {human(exe.stat().st_size)}")
     budget = 50 * 1024 * 1024
-    print(f"预算 50 MB -> {'通过 ✓' if size <= budget else f'超出 {human(size - budget)} ✗'}")
+    print(f"预算 50 MB -> {'通过' if size <= budget else f'超出 {human(size - budget)}'}")
     print(f"\n绿色版：直接把 dist/{args.name} 整个文件夹拷走即可运行（图标：{png.name}）")
     return 0
 

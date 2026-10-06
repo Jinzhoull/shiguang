@@ -43,7 +43,7 @@ class OnboardingOverlay(ctk.CTkFrame):
     """
 
     #: 插画画布边长（逻辑像素）。裸 Canvas 的尺寸是物理像素，所以要过 lpx()。
-    SUN_SIZE = 108
+    SUN_SIZE = theme.ONBOARDING_SUN_SIZE
 
     def __init__(self, master: tk.Misc, on_done) -> None:
         super().__init__(master, corner_radius=0, fg_color=theme.pair("bg"),

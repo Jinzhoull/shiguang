@@ -131,7 +131,7 @@ class SettingsPage(ctk.CTkFrame):
         hotkey_row.grid_columnconfigure(0, weight=1)
         self.hotkey_entry = ctk.CTkEntry(
             hotkey_row, font=theme.font("small"), height=26, corner_radius=8,
-            fg_color=theme.pair("bg_alt"), border_color=theme.pair("border"),
+            fg_color=theme.pair("bg_alt"), border_color=theme.pair("control_border"),
             border_width=1, text_color=theme.pair("text"))
         self.hotkey_entry.grid(row=0, column=0, sticky="ew")
         self.hotkey_entry.insert(0, self.store.settings.get("hotkey", "Ctrl+Shift+T"))
@@ -143,7 +143,7 @@ class SettingsPage(ctk.CTkFrame):
         self._saved_job = None
         ctk.CTkButton(hotkey_row, text="应用", width=56, height=26, corner_radius=8,
                       fg_color=theme.pair("accent"), hover_color=theme.pair("accent_hover"),
-                      text_color=("#FFFFFF", "#2D2A26"), font=theme.font("small"),
+                      text_color=theme.ON_ACCENT, font=theme.font("small"),
                       command=self._apply_hotkey).grid(row=0, column=1, padx=(8, 0))
         self.hotkey_hint = widgets.TextLabel(
             card, text="", font=theme.font("tiny"), text_color=theme.pair("text_muted"),
@@ -188,7 +188,7 @@ class SettingsPage(ctk.CTkFrame):
         value = self.hotkey_entry.get().strip()
         self.app.on_setting("hotkey", value)
         self.store.set_setting("hotkey_enabled", True)
-        self.store.save()
+        self.app.save_data()
         self._hotkey_status()
         hk = getattr(self.app, "hotkey", None)
         if hk is not None and hk.active:
@@ -215,7 +215,7 @@ class SettingsPage(ctk.CTkFrame):
     def _end_saved_flash(self) -> None:
         self._saved_job = None
         try:
-            self.hotkey_entry.configure(border_color=theme.pair("border"))
+            self.hotkey_entry.configure(border_color=theme.pair("control_border"))
         except Exception:  # noqa: BLE001
             pass
         self._hotkey_status()
@@ -511,7 +511,7 @@ class SettingsPage(ctk.CTkFrame):
 
         def on_ok() -> None:
             count = self.store.clear_completed()
-            self.store.save()
+            self.app.save_data()
             self.app.refresh()
             self.app.toast(f"已清空 {count} 条已完成任务（历史统计保留）")
 
